@@ -1,6 +1,12 @@
 ﻿# libretto-printer
 
-Couche 1 monorepo: Next.js frontend + FastAPI backend.
+Application web Next.js + FastAPI : ingestion de partitions (PDF pour l'instant), extraction libretto via Gemini, export PDF.
+
+## Stack
+
+- `web/` — Next.js (App Router)
+- `api/` — FastAPI
+- Extraction prévue : Gemini 3.5 Flash Lite
 
 ## Prerequisites
 
@@ -41,8 +47,17 @@ App: http://localhost:3000
 
 ## Env (root `.env` only)
 
-| Variable | Used by | Default |
-|----------|---------|---------|
-| `GEMINI_API_KEY` | API | (empty) |
-| `CORS_ORIGINS` | API | `http://localhost:3000` |
-| `NEXT_PUBLIC_API_URL` | Web | `http://localhost:8000` |
+| Variable              | Used by | Default                 |
+| --------------------- | ------- | ----------------------- |
+| `GEMINI_API_KEY`      | API     | (empty)                 |
+| `CORS_ORIGINS`        | API     | `http://localhost:3000` |
+| `NEXT_PUBLIC_API_URL` | Web     | `http://localhost:8000` |
+
+Limites publiques (taille, pages, batch) : http://localhost:8000/config — définies dans `api/app/config.py`, chargées par le front.
+
+## Couche 2 — Ingestion (étape actuelle)
+
+Vérification **côté navigateur** (pdf.js) avec les limites lues depuis l'API.  
+Le PDF reste en mémoire front ; **aucun upload** tant que l'extraction n'est pas lancée.
+
+Les routes API `/ingest/...` restent disponibles pour l'étape suivante (upload + rendu par lots de 5 + Gemini).

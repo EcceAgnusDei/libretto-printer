@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 python-dotenv
 pydantic-settings
+python-multipart
+pymupdf
+pillow
