@@ -9,6 +9,14 @@ Couche 1 monorepo: Next.js frontend + FastAPI backend.
 
 ## Setup
 
+Copy the env template once at the **repo root**:
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env` and set `GEMINI_API_KEY`. This is the only env file used by both API and web.
+
 ### API (FastAPI)
 
 ```powershell
@@ -16,13 +24,6 @@ cd api
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-Copy root `.env.example` values into `api/.env` (or set env vars), then:
-
-```powershell
-cd api
-.\.venv\Scripts\Activate.ps1
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -33,16 +34,15 @@ API health: http://localhost:8000/health
 ```powershell
 cd web
 npm install
-copy .env.example .env.local
 npm run dev
 ```
 
 App: http://localhost:3000
 
-## Env
+## Env (root `.env` only)
 
-| Variable | Where | Default |
-|----------|-------|---------|
+| Variable | Used by | Default |
+|----------|---------|---------|
 | `GEMINI_API_KEY` | API | (empty) |
 | `CORS_ORIGINS` | API | `http://localhost:3000` |
 | `NEXT_PUBLIC_API_URL` | Web | `http://localhost:8000` |
