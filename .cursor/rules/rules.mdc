@@ -1,0 +1,14 @@
+---
+description: Règles globales du projet courant
+alwaysApply: true
+---
+
+# Règles (toujours actives)
+
+- Ne mets pas de commentaires sans que je le demande
+- Lorsque je te demande de mettre un commentaire, utilise "/\*"
+- Ne crée pas de fichiers tests sans que je le demande
+- Pour créer un lien, n'utilise pas le composant Button mais un Link avec une classe hérité du variant link du composant Bouton
+- Emploie le vouvoiement
+- N'ajoute pas de code mort
+- après chaque modification apporté au code, dit quels fichiers ont été changés et pourquoi
