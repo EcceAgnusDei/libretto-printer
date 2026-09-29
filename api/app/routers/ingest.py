@@ -39,6 +39,11 @@ async def get_session(session_id: str, offset: int = 0, limit: int = 5):
     )
 
 
+@router.delete("/sessions/{session_id}", status_code=204)
+async def delete_session(session_id: str):
+    ingest_service.delete_session(session_id)
+
+
 @router.post("/sessions/{session_id}/pages", response_model=BatchAppendResponse)
 async def append_pages(
     session_id: str,

@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.routers.extract import router as extract_router
 from app.routers.ingest import router as ingest_router
 
 app = FastAPI(title="libretto-printer API", version="0.1.0")
@@ -15,6 +16,7 @@ app.add_middleware(
 )
 
 app.include_router(ingest_router)
+app.include_router(extract_router)
 
 
 @app.get("/health")

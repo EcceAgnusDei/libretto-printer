@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import uuid
 from dataclasses import dataclass
 from io import BytesIO
@@ -19,6 +21,14 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ".webp",
 }
 ALLOWED_PDF_TYPE = "application/pdf"
+SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+
+
+def assert_safe_session_id(session_id: str) -> str:
+    """Reject path traversal and non-uuid session ids."""
+    if not SESSION_ID_RE.fullmatch(session_id):
+        raise HTTPException(status_code=400, detail="session_id invalide")
+    return session_id
 
 
 @dataclass
@@ -38,7 +48,12 @@ class SessionMeta:
 
 
 def _session_dir(session_id: str) -> Path:
-    return settings.sessions_dir / session_id
+    assert_safe_session_id(session_id)
+    base = settings.sessions_dir.resolve()
+    path = (base / session_id).resolve()
+    if not path.is_relative_to(base):
+        raise HTTPException(status_code=400, detail="session_id invalide")
+    return path
 
 
 def _pages_dir(session_id: str) -> Path:
@@ -112,6 +127,30 @@ def create_session(source_name: str = "") -> SessionMeta:
 
 def get_session(session_id: str) -> SessionMeta:
     return _load_meta(session_id)
+
+
+def delete_session(session_id: str) -> None:
+    directory = _session_dir(session_id)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Session introuvable")
+    shutil.rmtree(directory)
+
+
+def require_source_pdf(session_id: str) -> Path:
+    """Ensure session meta says PDF and source.pdf exists on disk."""
+    meta = _load_meta(session_id)
+    if not meta.has_pdf or meta.pdf_page_count is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Aucun PDF attaché à cette session",
+        )
+    path = _pdf_path(session_id)
+    if not path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail="PDF source manquant sur le disque",
+        )
+    return path
 
 
 def list_pages(session_id: str, offset: int = 0, limit: int | None = None) -> list[dict]:

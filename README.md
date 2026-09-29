@@ -55,9 +55,16 @@ App: http://localhost:3000
 
 Limites publiques (taille, pages, batch) : http://localhost:8000/config — définies dans `api/app/config.py`, chargées par le front.
 
-## Couche 2 — Ingestion (étape actuelle)
+## Couche 3 — Déclenchement (étape actuelle)
 
-Vérification **côté navigateur** (pdf.js) avec les limites lues depuis l'API.  
-Le PDF reste en mémoire front ; **aucun upload** tant que l'extraction n'est pas lancée.
+1. Vérification PDF **locale** (pdf.js) — aucun upload.
+2. Clic **Extraire le libretto** :
+   - `GET /health` (exige `gemini_configured`)
+   - `POST /ingest/sessions`
+   - `POST /ingest/sessions/{id}/pdf`
+   - `POST /extract/sessions/{id}/start` → job `status: started`
+   - En cas d'échec après création de session : `DELETE /ingest/sessions/{id}` (rollback)
 
-Les routes API `/ingest/...` restent disponibles pour l'étape suivante (upload + rendu par lots de 5 + Gemini).
+`session_id` doit être un uuid hex 32 chars ; `start` exige que `source.pdf` existe sur disque.
+
+Pass 1 / Pass 2 Gemini ne tournent pas encore. Suivi : `GET /extract/sessions/{id}/status`.

@@ -8,15 +8,24 @@ import {
   fetchPublicConfig,
   type PublicConfig,
 } from "../lib/apiConfig";
+import {
+  triggerExtraction,
+  type ExtractStartResult,
+} from "../lib/extract";
 import { validatePdfLocally, type LocalPdfPreview } from "../lib/pdfLocal";
+
+type UiPhase = "idle" | "validating" | "extracting";
 
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [limits, setLimits] = useState<PublicConfig>(DEFAULT_PUBLIC_CONFIG);
-  const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState<UiPhase>("idle");
   const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<LocalPdfPreview | null>(null);
+  const [job, setJob] = useState<ExtractStartResult | null>(null);
+
+  const busy = phase !== "idle";
 
   useEffect(() => {
     let cancelled = false;
@@ -57,7 +66,8 @@ export default function Home() {
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0 || busy) return;
     setError(null);
-    setBusy(true);
+    setJob(null);
+    setPhase("validating");
 
     try {
       const files = Array.from(fileList);
@@ -71,7 +81,25 @@ export default function Home() {
       setLoaded(null);
       setError(err instanceof Error ? err.message : "Erreur de vérification");
     } finally {
-      setBusy(false);
+      setPhase("idle");
+    }
+  }
+
+  async function onExtract() {
+    if (!loaded || busy) return;
+    setError(null);
+    setJob(null);
+    setPhase("extracting");
+
+    try {
+      const result = await triggerExtraction(loaded.file);
+      setJob(result);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Échec du déclenchement",
+      );
+    } finally {
+      setPhase("idle");
     }
   }
 
@@ -108,14 +136,14 @@ export default function Home() {
       <main className="w-full max-w-3xl space-y-8">
         <header className="space-y-2">
           <p className="text-sm tracking-wide text-zinc-500 uppercase">
-            Couche 2 — Ingestion
+            Couche 3 — Déclenchement
           </p>
           <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
             libretto-printer
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Vérification du PDF dans le navigateur. Aucun envoi au serveur tant
-            que l&apos;extraction n&apos;est pas lancée.
+            Vérification locale du PDF, puis envoi au serveur uniquement au
+            lancement de l&apos;extraction.
           </p>
         </header>
 
@@ -142,9 +170,11 @@ export default function Home() {
           } ${busy ? "pointer-events-none opacity-60" : ""}`}
         >
           <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
-            {busy
+            {phase === "validating"
               ? "Vérification du PDF…"
-              : "Déposez un PDF, ou cliquez pour choisir"}
+              : phase === "extracting"
+                ? "Envoi et démarrage…"
+                : "Déposez un PDF, ou cliquez pour choisir"}
           </span>
           <span className="text-xs text-zinc-500">PDF uniquement</span>
           <input
@@ -178,30 +208,60 @@ export default function Home() {
                 sizes="160px"
               />
             </div>
-            <div className="space-y-1">
-              <h2 className="flex items-center gap-1.5 text-lg font-bold text-emerald-600 dark:text-emerald-400">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  className="size-5 shrink-0"
-                  aria-hidden="true"
-                >
-                  <path
-                    fillRule="evenodd"
-                    d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-                PDF valide
-              </h2>
-              <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                {loaded.sourceName}
-              </p>
-              <p className="text-sm text-zinc-500">
-                {loaded.pageCount} page{loaded.pageCount > 1 ? "s" : ""}
-              </p>
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <h2 className="flex items-center gap-1.5 text-lg font-bold text-emerald-600 dark:text-emerald-400">
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="size-5 shrink-0"
+                    aria-hidden="true"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M16.704 4.153a.75.75 0 0 1 .143 1.052l-8 10.5a.75.75 0 0 1-1.127.075l-4.5-4.5a.75.75 0 0 1 1.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 0 1 1.05-.143Z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                  PDF valide
+                </h2>
+                <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                  {loaded.sourceName}
+                </p>
+                <p className="text-sm text-zinc-500">
+                  {loaded.pageCount} page{loaded.pageCount > 1 ? "s" : ""}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void onExtract()}
+                disabled={busy}
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                {phase === "extracting"
+                  ? "Déclenchement…"
+                  : "Extraire le libretto"}
+              </button>
             </div>
+          </section>
+        )}
+
+        {job && (
+          <section className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+            <p className="font-medium">Extraction démarrée</p>
+            <p className="mt-1 font-mono text-xs break-all">
+              session: {job.sessionId}
+            </p>
+            <p className="mt-1">
+              status: <span className="font-mono">{job.status}</span> ·{" "}
+              {job.pdfPageCount} page{job.pdfPageCount > 1 ? "s" : ""} ·{" "}
+              {job.sourceName}
+            </p>
+            <p className="mt-2 text-xs opacity-80">
+              Pass 1 / Pass 2 Gemini : pas encore exécutés (déclenchement
+              seulement).
+            </p>
           </section>
         )}
       </main>
