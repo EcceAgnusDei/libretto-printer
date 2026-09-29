@@ -5,7 +5,6 @@ from fastapi.responses import FileResponse
 
 from app.config import settings
 from app.schemas.ingest import (
-    BatchAppendResponse,
     CreateSessionResponse,
     PageInfo,
     PdfRenderBatchResponse,
@@ -44,33 +43,16 @@ async def delete_session(session_id: str):
     ingest_service.delete_session(session_id)
 
 
-@router.post("/sessions/{session_id}/pages", response_model=BatchAppendResponse)
-async def append_pages(
-    session_id: str,
-    files: list[UploadFile] = File(...),
-):
-    meta, appended = await ingest_service.append_image_batch(session_id, files)
-    return BatchAppendResponse(
-        session_id=meta.session_id,
-        appended=[PageInfo(**p) for p in appended],
-        page_count=meta.page_count,
-        batch_size=settings.ingest_batch_size,
-    )
-
-
 @router.post("/sessions/{session_id}/pdf", response_model=PdfUploadResponse)
 async def upload_pdf(
     session_id: str,
     file: UploadFile = File(...),
 ):
-    meta, thumbnail = await ingest_service.attach_pdf(session_id, file)
+    meta = await ingest_service.attach_pdf(session_id, file)
     return PdfUploadResponse(
         session_id=meta.session_id,
         source_name=meta.source_name,
         pdf_page_count=meta.pdf_page_count or 0,
-        thumbnail_url=thumbnail["url"],
-        thumbnail_width=thumbnail["width"],
-        thumbnail_height=thumbnail["height"],
     )
 
 

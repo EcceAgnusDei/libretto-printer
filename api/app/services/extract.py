@@ -44,6 +44,7 @@ def start_job(session_id: str) -> dict:
 
     meta = ingest_service.get_session(session_id)
     ingest_service.require_source_pdf(session_id)
+    ingest_service.require_pages_rendered(session_id)
 
     existing = _load_job(session_id)
     if existing and existing.get("status") in ACTIVE_STATUSES:

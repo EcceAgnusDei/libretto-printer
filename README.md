@@ -1,12 +1,13 @@
 ﻿# libretto-printer
 
-Application web Next.js + FastAPI : ingestion de partitions (PDF pour l'instant), extraction libretto via Gemini, export PDF.
+Application web Next.js + FastAPI : ingestion de partitions PDF, extraction libretto via Gemini, export PDF.
 
 ## Stack
 
 - `web/` — Next.js (App Router)
 - `api/` — FastAPI
 - Extraction prévue : Gemini 3.5 Flash Lite
+- Entrée MVP : **PDF uniquement** (côté API)
 
 ## Prerequisites
 
@@ -55,16 +56,20 @@ App: http://localhost:3000
 
 Limites publiques (taille, pages, batch) : http://localhost:8000/config — définies dans `api/app/config.py`, chargées par le front.
 
-## Couche 3 — Déclenchement (étape actuelle)
+## Couche 2 — Ingestion (faite)
 
-1. Vérification PDF **locale** (pdf.js) — aucun upload.
-2. Clic **Extraire le libretto** :
-   - `GET /health` (exige `gemini_configured`)
-   - `POST /ingest/sessions`
-   - `POST /ingest/sessions/{id}/pdf`
-   - `POST /extract/sessions/{id}/start` → job `status: started`
-   - En cas d'échec après création de session : `DELETE /ingest/sessions/{id}` (rollback)
+Flux au clic **Extraire le libretto** :
 
-`session_id` doit être un uuid hex 32 chars ; `start` exige que `source.pdf` existe sur disque.
+1. Vérification PDF **locale** (pdf.js) — taille / pages / lisibilité.
+2. `GET /health` (exige `gemini_configured`).
+3. `POST /ingest/sessions`
+4. `POST /ingest/sessions/{id}/pdf` — validation **serveur** :
+   - taille max (`max_upload_bytes`, lecture par chunks)
+   - en-tête `%PDF`
+   - PDF lisible (PyMuPDF), non protégé par mot de passe
+   - 1…`max_pages` pages
+5. `POST /ingest/sessions/{id}/pdf/render` en boucle (lots de `ingest_batch_size`) jusqu’à `done=true` — PNG normalisés (DPI 150, max 2048 px).
+6. `POST /extract/sessions/{id}/start` — exige PDF + pages rendues.
+7. Rollback : `DELETE /ingest/sessions/{id}` si échec avant le start.
 
-Pass 1 / Pass 2 Gemini ne tournent pas encore. Suivi : `GET /extract/sessions/{id}/status`.
+Session sur disque : `data/sessions/{id}/source.pdf`, `pages/page_XXXX.png`, `meta.json`.

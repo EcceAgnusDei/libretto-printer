@@ -5,7 +5,6 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 
 import pymupdf
@@ -14,13 +13,17 @@ from PIL import Image
 
 from app.config import settings
 
-ALLOWED_IMAGE_TYPES = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/webp": ".webp",
-}
-ALLOWED_PDF_TYPE = "application/pdf"
+ALLOWED_PDF_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/x-pdf",
+        "application/acrobat",
+        "applications/vnd.pdf",
+        "text/pdf",
+        "text/x-pdf",
+    }
+)
+PDF_MAGIC = b"%PDF"
 SESSION_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
@@ -42,9 +45,11 @@ class SessionMeta:
 
     @property
     def done(self) -> bool:
-        if self.has_pdf and self.pdf_page_count is not None:
-            return self.rendered_count >= self.pdf_page_count
-        return self.page_count > 0
+        return (
+            self.has_pdf
+            and self.pdf_page_count is not None
+            and self.rendered_count >= self.pdf_page_count
+        )
 
 
 def _session_dir(session_id: str) -> Path:
@@ -68,16 +73,8 @@ def _pdf_path(session_id: str) -> Path:
     return _session_dir(session_id) / "source.pdf"
 
 
-def _thumbnail_path(session_id: str) -> Path:
-    return _session_dir(session_id) / "thumbnail.png"
-
-
 def _page_url(session_id: str, filename: str) -> str:
     return f"/ingest/sessions/{session_id}/pages/{filename}"
-
-
-def _thumbnail_url(session_id: str) -> str:
-    return f"/ingest/sessions/{session_id}/thumbnail"
 
 
 def _load_meta(session_id: str) -> SessionMeta:
@@ -187,14 +184,6 @@ def get_page_path(session_id: str, filename: str) -> Path:
     return path
 
 
-def get_thumbnail_path(session_id: str) -> Path:
-    _load_meta(session_id)
-    path = _thumbnail_path(session_id)
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Miniature introuvable")
-    return path
-
-
 def _normalize_image(image: Image.Image) -> Image.Image:
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
@@ -227,110 +216,103 @@ def _save_page_image(session_id: str, index: int, image: Image.Image) -> dict:
     }
 
 
+def _format_max_size(max_bytes: int) -> str:
+    mo = max_bytes / (1024 * 1024)
+    if mo >= 1:
+        rounded = int(mo) if mo.is_integer() else round(mo, 1)
+        return f"{rounded} Mo"
+    ko = max_bytes / 1024
+    rounded = int(ko) if ko.is_integer() else round(ko, 1)
+    return f"{rounded} Ko"
+
+
 async def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
-    data = await file.read()
+    """Read upload in chunks; reject as soon as size exceeds the limit."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Fichier trop volumineux "
+                    f"(max {_format_max_size(max_bytes)})"
+                ),
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if not data:
-        raise HTTPException(status_code=400, detail=f"Fichier vide: {file.filename}")
-    if len(data) > max_bytes:
         raise HTTPException(
             status_code=400,
-            detail=f"Fichier trop volumineux (max {max_bytes} octets)",
+            detail=f"Fichier vide: {file.filename or 'upload'}",
         )
     return data
 
 
-async def append_image_batch(
-    session_id: str,
-    files: list[UploadFile],
-) -> tuple[SessionMeta, list[dict]]:
-    meta = _load_meta(session_id)
-    if meta.has_pdf:
-        raise HTTPException(
-            status_code=400,
-            detail="Cette session contient un PDF; utilisez le rendu par lots",
-        )
-    batch_size = settings.ingest_batch_size
-    if not files:
-        raise HTTPException(status_code=400, detail="Aucun fichier fourni")
-    if len(files) > batch_size:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Maximum {batch_size} pages par envoi",
-        )
-    if meta.page_count + len(files) > settings.max_pages_per_session:
-        raise HTTPException(status_code=400, detail="Nombre de pages maximal dépassé")
-
-    appended: list[dict] = []
-    next_index = meta.page_count
-    for upload in files:
-        content_type = (upload.content_type or "").lower()
-        if content_type not in ALLOWED_IMAGE_TYPES and not (
-            upload.filename or ""
-        ).lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Type non supporté: {upload.filename or content_type}",
-            )
-        raw = await _read_upload(upload, settings.max_upload_bytes)
-        try:
-            with Image.open(BytesIO(raw)) as img:
-                img.load()
-                page = _save_page_image(session_id, next_index, img.copy())
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Image illisible: {upload.filename}",
-            ) from exc
-        appended.append(page)
-        next_index += 1
-
-    if not meta.source_name or meta.source_name == "untitled":
-        meta.source_name = files[0].filename or meta.source_name
-    meta.page_count = next_index
-    meta.rendered_count = next_index
-    _save_meta(meta)
-    return meta, appended
-
-
-async def attach_pdf(session_id: str, file: UploadFile) -> tuple[SessionMeta, dict]:
-    meta = _load_meta(session_id)
-    if meta.page_count > 0 or meta.has_pdf:
-        raise HTTPException(
-            status_code=400,
-            detail="La session contient déjà des pages ou un PDF",
-        )
-    content_type = (file.content_type or "").lower()
-    filename = file.filename or "source.pdf"
-    if content_type not in (ALLOWED_PDF_TYPE, "application/x-pdf", "") and not filename.lower().endswith(".pdf"):
+def _assert_pdf_payload(filename: str, content_type: str, raw: bytes) -> None:
+    name = filename or "source.pdf"
+    ctype = (content_type or "").lower().split(";")[0].strip()
+    looks_pdf_name = name.lower().endswith(".pdf")
+    looks_pdf_type = ctype in ALLOWED_PDF_TYPES or ctype == ""
+    if not looks_pdf_name and not looks_pdf_type:
         raise HTTPException(status_code=400, detail="Seul un PDF est accepté")
+    # ISO 32000: "%PDF" appears in the first 1024 bytes.
+    if PDF_MAGIC not in raw[:1024]:
+        raise HTTPException(
+            status_code=400,
+            detail="Ce fichier n'est pas un PDF valide (en-tête manquant)",
+        )
 
-    raw = await _read_upload(file, settings.max_upload_bytes)
+
+def _open_and_validate_pdf(raw: bytes) -> int:
     try:
         doc = pymupdf.open(stream=raw, filetype="pdf")
     except Exception as exc:
         raise HTTPException(status_code=400, detail="PDF illisible") from exc
 
     try:
+        if doc.needs_pass:
+            raise HTTPException(
+                status_code=400,
+                detail="PDF protégé par mot de passe non supporté",
+            )
+
         page_count = doc.page_count
         if page_count < 1:
             raise HTTPException(status_code=400, detail="PDF sans pages")
         if page_count > settings.max_pages_per_session:
-            raise HTTPException(status_code=400, detail="PDF trop long")
-
-        zoom = settings.render_dpi / 72.0
-        matrix = pymupdf.Matrix(zoom, zoom)
-        page = doc.load_page(0)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        thumb = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        thumb = _normalize_image(thumb)
-        thumb.save(_thumbnail_path(session_id), format="PNG", optimize=True)
-        thumb_info = {
-            "width": thumb.size[0],
-            "height": thumb.size[1],
-            "url": _thumbnail_url(session_id),
-        }
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "PDF trop long "
+                    f"(max {settings.max_pages_per_session} pages)"
+                ),
+            )
+        # Touch first page to catch truncated / corrupt trailers early.
+        try:
+            doc.load_page(0)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="PDF illisible") from exc
+        return page_count
     finally:
         doc.close()
+
+
+async def attach_pdf(session_id: str, file: UploadFile) -> SessionMeta:
+    meta = _load_meta(session_id)
+    if meta.has_pdf:
+        raise HTTPException(
+            status_code=400,
+            detail="La session contient déjà un PDF",
+        )
+    filename = file.filename or "source.pdf"
+    raw = await _read_upload(file, settings.max_upload_bytes)
+    _assert_pdf_payload(filename, file.content_type or "", raw)
+    page_count = _open_and_validate_pdf(raw)
 
     _pdf_path(session_id).write_bytes(raw)
     meta.source_name = filename
@@ -339,7 +321,33 @@ async def attach_pdf(session_id: str, file: UploadFile) -> tuple[SessionMeta, di
     meta.rendered_count = 0
     meta.page_count = 0
     _save_meta(meta)
-    return meta, thumb_info
+    return meta
+
+
+def require_pages_rendered(session_id: str) -> SessionMeta:
+    """Ensure PDF pages were rendered to PNG before downstream steps."""
+    meta = _load_meta(session_id)
+    if not meta.has_pdf or meta.pdf_page_count is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Aucun PDF attaché à cette session",
+        )
+    if not meta.done:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Pages non rendues: "
+                f"{meta.rendered_count}/{meta.pdf_page_count}. "
+                "Appelez POST /ingest/sessions/{id}/pdf/render jusqu'à done=true"
+            ),
+        )
+    pages = list(_pages_dir(session_id).glob("page_*.png"))
+    if len(pages) < meta.pdf_page_count:
+        raise HTTPException(
+            status_code=400,
+            detail="Pages PNG manquantes sur le disque; relancez le rendu",
+        )
+    return meta
 
 
 def render_pdf_batch(session_id: str, start_page: int | None = None) -> tuple[SessionMeta, list[dict]]:

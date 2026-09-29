@@ -11,6 +11,7 @@ import {
 import {
   triggerExtraction,
   type ExtractStartResult,
+  type IngestProgress,
 } from "../lib/extract";
 import { validatePdfLocally, type LocalPdfPreview } from "../lib/pdfLocal";
 
@@ -24,6 +25,9 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<LocalPdfPreview | null>(null);
   const [job, setJob] = useState<ExtractStartResult | null>(null);
+  const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(
+    null,
+  );
 
   const busy = phase !== "idle";
 
@@ -67,6 +71,7 @@ export default function Home() {
     if (!fileList || fileList.length === 0 || busy) return;
     setError(null);
     setJob(null);
+    setIngestProgress(null);
     setPhase("validating");
 
     try {
@@ -89,10 +94,11 @@ export default function Home() {
     if (!loaded || busy) return;
     setError(null);
     setJob(null);
+    setIngestProgress(null);
     setPhase("extracting");
 
     try {
-      const result = await triggerExtraction(loaded.file);
+      const result = await triggerExtraction(loaded.file, setIngestProgress);
       setJob(result);
     } catch (err) {
       setError(
@@ -100,6 +106,7 @@ export default function Home() {
       );
     } finally {
       setPhase("idle");
+      setIngestProgress(null);
     }
   }
 
@@ -131,19 +138,29 @@ export default function Home() {
     void handleFiles(event.dataTransfer.files);
   }
 
+  function extractingLabel(): string {
+    if (!ingestProgress) return "Envoi et rendu…";
+    if (ingestProgress.phase === "upload") return "Upload du PDF…";
+    if (ingestProgress.phase === "render") {
+      const { renderedCount, pdfPageCount } = ingestProgress;
+      return `Rendu des pages… ${renderedCount}/${pdfPageCount}`;
+    }
+    return "Démarrage de l'extraction…";
+  }
+
   return (
     <div className="flex min-h-full flex-1 justify-center px-6 py-10">
       <main className="w-full max-w-3xl space-y-8">
         <header className="space-y-2">
           <p className="text-sm tracking-wide text-zinc-500 uppercase">
-            Couche 3 — Déclenchement
+            Couche 2 — Ingestion PDF
           </p>
           <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
             libretto-printer
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Vérification locale du PDF, puis envoi au serveur uniquement au
-            lancement de l&apos;extraction.
+            Vérification locale, puis upload serveur, rendu page par page, et
+            déclenchement d&apos;extraction.
           </p>
         </header>
 
@@ -173,7 +190,7 @@ export default function Home() {
             {phase === "validating"
               ? "Vérification du PDF…"
               : phase === "extracting"
-                ? "Envoi et démarrage…"
+                ? extractingLabel()
                 : "Déposez un PDF, ou cliquez pour choisir"}
           </span>
           <span className="text-xs text-zinc-500">PDF uniquement</span>
@@ -240,7 +257,7 @@ export default function Home() {
                 className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
               >
                 {phase === "extracting"
-                  ? "Déclenchement…"
+                  ? extractingLabel()
                   : "Extraire le libretto"}
               </button>
             </div>
@@ -249,13 +266,15 @@ export default function Home() {
 
         {job && (
           <section className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
-            <p className="font-medium">Extraction démarrée</p>
+            <p className="font-medium">
+              Ingestion terminée · extraction démarrée
+            </p>
             <p className="mt-1 font-mono text-xs break-all">
               session: {job.sessionId}
             </p>
             <p className="mt-1">
               status: <span className="font-mono">{job.status}</span> ·{" "}
-              {job.pdfPageCount} page{job.pdfPageCount > 1 ? "s" : ""} ·{" "}
+              {job.renderedCount}/{job.pdfPageCount} pages rendues ·{" "}
               {job.sourceName}
             </p>
             <p className="mt-2 text-xs opacity-80">
