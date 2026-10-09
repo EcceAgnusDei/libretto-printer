@@ -14,9 +14,13 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.5-flash"
     cors_origins: str = "http://localhost:3000"
     data_dir: Path = Path(__file__).resolve().parents[2] / "data"
     ingest_batch_size: int = 5
+    extract_batch_size: int = 5
+    extract_max_retries: int = 2
+    extract_retry_backoff_seconds: float = 2.0
     max_upload_bytes: int = 50 * 1024 * 1024
     max_pages_per_session: int = 500
     render_dpi: int = 150

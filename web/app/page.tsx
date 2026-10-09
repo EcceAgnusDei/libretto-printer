@@ -9,8 +9,11 @@ import {
   type PublicConfig,
 } from "../lib/apiConfig";
 import {
+  fetchExtractStatus,
+  fetchLibretto,
   triggerExtraction,
   type ExtractStartResult,
+  type ExtractStatusResult,
   type IngestProgress,
 } from "../lib/extract";
 import { validatePdfLocally, type LocalPdfPreview } from "../lib/pdfLocal";
@@ -25,11 +28,17 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<LocalPdfPreview | null>(null);
   const [job, setJob] = useState<ExtractStartResult | null>(null);
+  const [liveStatus, setLiveStatus] = useState<ExtractStatusResult | null>(
+    null,
+  );
+  const [librettoMd, setLibrettoMd] = useState<string | null>(null);
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(
     null,
   );
 
   const busy = phase !== "idle";
+  const extractBusy =
+    liveStatus?.status === "started" || liveStatus?.status === "running";
 
   useEffect(() => {
     let cancelled = false;
@@ -67,10 +76,49 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!job) return;
+    const terminal =
+      liveStatus?.status === "done" || liveStatus?.status === "error";
+    if (terminal) return;
+
+    let cancelled = false;
+
+    async function tick() {
+      try {
+        const status = await fetchExtractStatus(job!.sessionId);
+        if (cancelled) return;
+        setLiveStatus(status);
+        if (status.status === "done") {
+          const lib = await fetchLibretto(job!.sessionId);
+          if (!cancelled) setLibrettoMd(lib.markdown);
+        }
+        if (status.status === "error") {
+          setError(status.error ?? "Extraction échouée");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error ? err.message : "Erreur de suivi extraction",
+          );
+        }
+      }
+    }
+
+    void tick();
+    const id = window.setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [job, liveStatus?.status]);
+
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0 || busy) return;
     setError(null);
     setJob(null);
+    setLiveStatus(null);
+    setLibrettoMd(null);
     setIngestProgress(null);
     setPhase("validating");
 
@@ -94,16 +142,27 @@ export default function Home() {
     if (!loaded || busy) return;
     setError(null);
     setJob(null);
+    setLiveStatus(null);
+    setLibrettoMd(null);
     setIngestProgress(null);
     setPhase("extracting");
 
     try {
       const result = await triggerExtraction(loaded.file, setIngestProgress);
       setJob(result);
+      setLiveStatus({
+        sessionId: result.sessionId,
+        status: result.status,
+        sourceName: result.sourceName,
+        pdfPageCount: result.pdfPageCount,
+        extractBatchSize: result.extractBatchSize,
+        totalBatches: result.totalBatches,
+        pagesDone: result.pagesDone,
+        currentBatch: result.currentBatch,
+        error: null,
+      });
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Échec du déclenchement",
-      );
+      setError(err instanceof Error ? err.message : "Échec du déclenchement");
     } finally {
       setPhase("idle");
       setIngestProgress(null);
@@ -148,19 +207,25 @@ export default function Home() {
     return "Démarrage de l'extraction…";
   }
 
+  const status = liveStatus ?? null;
+  const pagesDone = status?.pagesDone ?? job?.pagesDone ?? 0;
+  const pdfPageCount = status?.pdfPageCount ?? job?.pdfPageCount ?? 0;
+  const currentBatch = status?.currentBatch ?? job?.currentBatch ?? 0;
+  const totalBatches = status?.totalBatches ?? job?.totalBatches ?? 0;
+
   return (
     <div className="flex min-h-full flex-1 justify-center px-6 py-10">
       <main className="w-full max-w-3xl space-y-8">
         <header className="space-y-2">
           <p className="text-sm tracking-wide text-zinc-500 uppercase">
-            Couche 2 — Ingestion PDF
+            Extraction libretto — passe unique
           </p>
           <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
             libretto-printer
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Vérification locale, puis upload serveur, rendu page par page, et
-            déclenchement d&apos;extraction.
+            Upload PDF, rendu des pages, puis extraction Gemini en une passe
+            (lots de 5, contexte section Markdown).
           </p>
         </header>
 
@@ -253,34 +318,46 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => void onExtract()}
-                disabled={busy}
+                disabled={busy || extractBusy}
                 className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
               >
                 {phase === "extracting"
                   ? extractingLabel()
-                  : "Extraire le libretto"}
+                  : extractBusy
+                    ? "Extraction en cours…"
+                    : "Extraire le libretto"}
               </button>
             </div>
           </section>
         )}
 
-        {job && (
+        {job && status && (
           <section className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
             <p className="font-medium">
-              Ingestion terminée · extraction démarrée
+              {status.status === "done"
+                ? "Extraction terminée"
+                : status.status === "error"
+                  ? "Extraction en erreur"
+                  : "Extraction en cours"}
             </p>
             <p className="mt-1 font-mono text-xs break-all">
               session: {job.sessionId}
             </p>
             <p className="mt-1">
-              status: <span className="font-mono">{job.status}</span> ·{" "}
-              {job.renderedCount}/{job.pdfPageCount} pages rendues ·{" "}
-              {job.sourceName}
+              status: <span className="font-mono">{status.status}</span> · lot{" "}
+              {currentBatch}/{totalBatches} · pages {pagesDone}/{pdfPageCount}
             </p>
-            <p className="mt-2 text-xs opacity-80">
-              Pass 1 / Pass 2 Gemini : pas encore exécutés (déclenchement
-              seulement).
-            </p>
+          </section>
+        )}
+
+        {librettoMd !== null && (
+          <section className="space-y-2">
+            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+              libretto.md
+            </h2>
+            <pre className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-xs leading-relaxed whitespace-pre-wrap text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+              {librettoMd || "(vide)"}
+            </pre>
           </section>
         )}
       </main>

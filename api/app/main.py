@@ -34,4 +34,5 @@ def public_config():
         "max_upload_bytes": settings.max_upload_bytes,
         "max_pages": settings.max_pages_per_session,
         "ingest_batch_size": settings.ingest_batch_size,
+        "extract_batch_size": settings.extract_batch_size,
     }

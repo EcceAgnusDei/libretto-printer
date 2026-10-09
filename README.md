@@ -1,4 +1,4 @@
-﻿# libretto-printer
+# libretto-printer
 
 Application web Next.js + FastAPI : ingestion de partitions PDF, extraction libretto via Gemini, export PDF.
 
@@ -6,8 +6,9 @@ Application web Next.js + FastAPI : ingestion de partitions PDF, extraction libr
 
 - `web/` — Next.js (App Router)
 - `api/` — FastAPI
-- Extraction prévue : Gemini 3.5 Flash Lite
+- Extraction : **Gemini** (modèle configurable, défaut `gemini-3.5-flash-lite`)
 - Entrée MVP : **PDF uniquement** (côté API)
+- Sortie extraction : **un seul fichier** `libretto.md` (Markdown `#` / `##` / `###`)
 
 ## Prerequisites
 
@@ -22,7 +23,7 @@ Copy the env template once at the **repo root**:
 copy .env.example .env
 ```
 
-Edit `.env` and set `GEMINI_API_KEY`. This is the only env file used by both API and web.
+Edit `.env` and set `GEMINI_API_KEY` (optionnel : `GEMINI_MODEL`).
 
 ### API (FastAPI)
 
@@ -51,25 +52,48 @@ App: http://localhost:3000
 | Variable              | Used by | Default                 |
 | --------------------- | ------- | ----------------------- |
 | `GEMINI_API_KEY`      | API     | (empty)                 |
+| `GEMINI_MODEL`        | API     | `gemini-3.5-flash-lite` |
 | `CORS_ORIGINS`        | API     | `http://localhost:3000` |
 | `NEXT_PUBLIC_API_URL` | Web     | `http://localhost:8000` |
 
-Limites publiques (taille, pages, batch) : http://localhost:8000/config — définies dans `api/app/config.py`, chargées par le front.
+Limites publiques : http://localhost:8000/config
 
-## Couche 2 — Ingestion (faite)
+## Couche 2 — Ingestion
 
-Flux au clic **Extraire le libretto** :
+1. Vérification PDF locale (pdf.js)
+2. `POST /ingest/sessions` → upload PDF → render PNG par lots
+3. Session : `data/sessions/{id}/source.pdf`, `pages/page_XXXX.png`, `meta.json`
 
-1. Vérification PDF **locale** (pdf.js) — taille / pages / lisibilité.
-2. `GET /health` (exige `gemini_configured`).
-3. `POST /ingest/sessions`
-4. `POST /ingest/sessions/{id}/pdf` — validation **serveur** :
-   - taille max (`max_upload_bytes`, lecture par chunks)
-   - en-tête `%PDF`
-   - PDF lisible (PyMuPDF), non protégé par mot de passe
-   - 1…`max_pages` pages
-5. `POST /ingest/sessions/{id}/pdf/render` en boucle (lots de `ingest_batch_size`) jusqu’à `done=true` — PNG normalisés (DPI 150, max 2048 px).
-6. `POST /extract/sessions/{id}/start` — exige PDF + pages rendues.
-7. Rollback : `DELETE /ingest/sessions/{id}` si échec avant le start.
+## Couche 3 — Extraction (passe unique)
 
-Session sur disque : `data/sessions/{id}/source.pdf`, `pages/page_XXXX.png`, `meta.json`.
+Workflow :
+
+1. `POST /extract/sessions/{id}/start` — préconditions + job + worker fond
+2. Pour chaque lot de **5 pages** :
+   - lit `libretto.md`
+   - envoie à Gemini : images du lot + **contexte = depuis le dernier `##` jusqu’à la fin**
+   - Gemini renvoie la **section Markdown mise à jour** (sans numéros de page)
+   - remplace cette section dans `libretto.md`
+3. Statuts job : `started` → `running` → `done` | `error`
+4. Fichier unique : `data/sessions/{id}/libretto.md`
+
+Endpoints :
+
+- `POST /extract/sessions/{id}/start`
+- `GET /extract/sessions/{id}/status`
+- `GET /extract/sessions/{id}/libretto`
+
+### Tester
+
+```powershell
+# Session déjà rendue (toutes les pages PNG)
+Invoke-RestMethod -Method POST -Uri "http://localhost:8000/extract/sessions/SESSION_ID/start"
+# Suivre
+Invoke-RestMethod -Uri "http://localhost:8000/extract/sessions/SESSION_ID/status"
+# Lire le markdown
+Invoke-RestMethod -Uri "http://localhost:8000/extract/sessions/SESSION_ID/libretto"
+```
+
+Via l’UI : PDF → Extraire → progression des lots → aperçu `libretto.md` à la fin.
+
+Pour relancer : supprimer `extract_job.json` + `libretto.md` (ou toute la session) si le job est `done`/`error` ; si `running`, attendre la fin ou redémarrer l’API.

@@ -2,12 +2,7 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
 
-export type ExtractJobStatus =
-  | "started"
-  | "pass1"
-  | "pass2"
-  | "done"
-  | "error";
+export type ExtractJobStatus = "started" | "running" | "done" | "error";
 
 export type ExtractStartResult = {
   sessionId: string;
@@ -15,6 +10,22 @@ export type ExtractStartResult = {
   sourceName: string;
   pdfPageCount: number;
   renderedCount: number;
+  extractBatchSize: number;
+  totalBatches: number;
+  pagesDone: number;
+  currentBatch: number;
+};
+
+export type ExtractStatusResult = {
+  sessionId: string;
+  status: ExtractJobStatus;
+  sourceName: string;
+  pdfPageCount: number | null;
+  extractBatchSize: number | null;
+  totalBatches: number | null;
+  pagesDone: number | null;
+  currentBatch: number | null;
+  error: string | null;
 };
 
 export type IngestProgress = {
@@ -67,10 +78,7 @@ async function createSession(sourceName: string): Promise<string> {
   return data.session_id;
 }
 
-async function uploadPdf(
-  sessionId: string,
-  file: File,
-): Promise<number> {
+async function uploadPdf(sessionId: string, file: File): Promise<number> {
   const body = new FormData();
   body.set("file", file, file.name);
   const res = await fetch(`${apiBase()}/ingest/sessions/${sessionId}/pdf`, {
@@ -137,6 +145,10 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
     status: ExtractJobStatus;
     source_name: string;
     pdf_page_count: number;
+    extract_batch_size: number;
+    total_batches: number;
+    pages_done: number;
+    current_batch: number;
   };
   return {
     sessionId: data.session_id,
@@ -144,6 +156,10 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
     sourceName: data.source_name,
     pdfPageCount: data.pdf_page_count,
     renderedCount: data.pdf_page_count,
+    extractBatchSize: data.extract_batch_size,
+    totalBatches: data.total_batches,
+    pagesDone: data.pages_done,
+    currentBatch: data.current_batch,
   };
 }
 
@@ -185,17 +201,50 @@ export async function triggerExtraction(
   }
 }
 
-export async function fetchExtractStatus(sessionId: string): Promise<{
-  status: ExtractJobStatus;
-  error: string | null;
-}> {
+export async function fetchExtractStatus(
+  sessionId: string,
+): Promise<ExtractStatusResult> {
   const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/status`);
   if (!res.ok) {
     throw new Error(await readError(res));
   }
   const data = (await res.json()) as {
+    session_id: string;
     status: ExtractJobStatus;
+    source_name: string;
+    pdf_page_count: number | null;
+    extract_batch_size: number | null;
+    total_batches: number | null;
+    pages_done: number | null;
+    current_batch: number | null;
     error: string | null;
   };
-  return { status: data.status, error: data.error };
+  return {
+    sessionId: data.session_id,
+    status: data.status,
+    sourceName: data.source_name,
+    pdfPageCount: data.pdf_page_count,
+    extractBatchSize: data.extract_batch_size,
+    totalBatches: data.total_batches,
+    pagesDone: data.pages_done,
+    currentBatch: data.current_batch,
+    error: data.error,
+  };
+}
+
+export async function fetchLibretto(sessionId: string): Promise<{
+  status: ExtractJobStatus;
+  markdown: string;
+}> {
+  const res = await fetch(
+    `${apiBase()}/extract/sessions/${sessionId}/libretto`,
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  const data = (await res.json()) as {
+    status: ExtractJobStatus;
+    markdown: string;
+  };
+  return { status: data.status, markdown: data.markdown };
 }

@@ -5,3 +5,4 @@ pydantic-settings
 python-multipart
 pymupdf
 pillow
+google-genai
