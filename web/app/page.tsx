@@ -7,6 +7,7 @@ import {
   DEFAULT_PUBLIC_CONFIG,
   fetchPublicConfig,
   fetchQuotaForPages,
+  fetchQuotaUsage,
   type PublicConfig,
   type QuotaCheck,
 } from "../lib/apiConfig";
@@ -40,6 +41,9 @@ export default function Home() {
   );
   const [nowMs, setNowMs] = useState<number | null>(null);
   const [quotaConfirm, setQuotaConfirm] = useState<QuotaCheck | null>(null);
+  const [serverQuotaRemaining, setServerQuotaRemaining] = useState<
+    number | null | undefined
+  >(undefined);
 
   const busy = phase !== "idle";
   const extractBusy = liveStatus?.status === "running";
@@ -129,16 +133,51 @@ export default function Home() {
     liveStatus?.wait?.reason === "rate_limit"
       ? (liveStatus.wait.waitUntil ?? null)
       : null;
+  const dailyWaitUntil =
+    liveStatus?.wait?.reason === "daily"
+      ? (liveStatus.wait.waitUntil ?? null)
+      : null;
+  const isServerDailyPause =
+    (liveStatus?.status === "paused" ||
+      liveStatus?.wait?.reason === "daily") &&
+    liveStatus?.wait?.source !== "gemini";
 
   useEffect(() => {
-    if (!rateLimitWaitUntil) return;
+    const waitUntil = rateLimitWaitUntil ?? dailyWaitUntil;
+    if (!waitUntil) return;
     const timeoutId = window.setTimeout(() => setNowMs(Date.now()), 0);
     const intervalId = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => {
       window.clearTimeout(timeoutId);
       window.clearInterval(intervalId);
     };
-  }, [rateLimitWaitUntil]);
+  }, [rateLimitWaitUntil, dailyWaitUntil]);
+
+  useEffect(() => {
+    if (!isServerDailyPause) {
+      setServerQuotaRemaining(undefined);
+      return;
+    }
+    let cancelled = false;
+
+    async function refreshQuota() {
+      try {
+        const usage = await fetchQuotaUsage();
+        if (!cancelled) {
+          setServerQuotaRemaining(usage.batchesRemaining);
+        }
+      } catch {
+        if (!cancelled) setServerQuotaRemaining(undefined);
+      }
+    }
+
+    void refreshQuota();
+    const id = window.setInterval(() => void refreshQuota(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [isServerDailyPause, liveStatus?.sessionId]);
 
   const waitRemainingSec =
     rateLimitWaitUntil != null && nowMs != null
@@ -147,6 +186,14 @@ export default function Home() {
           Math.ceil(
             (new Date(rateLimitWaitUntil).getTime() - nowMs) / 1000,
           ),
+        )
+      : null;
+
+  const dailyRemainingSec =
+    dailyWaitUntil != null && nowMs != null
+      ? Math.max(
+          0,
+          Math.ceil((new Date(dailyWaitUntil).getTime() - nowMs) / 1000),
         )
       : null;
 
@@ -288,9 +335,19 @@ export default function Home() {
     wait?.reason === "daily" ||
     status?.error ===
       "dépassement des quota d'utilisation, réessayez demain";
+  const isGeminiDailyPause = isDailyWait && wait?.source === "gemini";
+  const serverQuotaAllowsResume =
+    serverQuotaRemaining === null ||
+    (typeof serverQuotaRemaining === "number" && serverQuotaRemaining > 0);
+  const dailyTimeAllowsResume =
+    dailyWaitUntil == null ||
+    (nowMs != null && nowMs >= new Date(dailyWaitUntil).getTime());
+  const canResumeDaily = isGeminiDailyPause
+    ? true
+    : dailyTimeAllowsResume || serverQuotaAllowsResume;
 
   async function onResumeExtract() {
-    if (!job || busy || extractBusy) return;
+    if (!job || busy || extractBusy || !canResumeDaily) return;
     setError(null);
     setPhase("extracting");
     try {
@@ -310,6 +367,14 @@ export default function Home() {
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Échec de la reprise");
+      if (isServerDailyPause) {
+        try {
+          const usage = await fetchQuotaUsage();
+          setServerQuotaRemaining(usage.batchesRemaining);
+        } catch {
+          /* ignore */
+        }
+      }
     } finally {
       setPhase("idle");
     }
@@ -515,10 +580,18 @@ export default function Home() {
                 <p className="font-medium">
                   dépassement des quota d&apos;utilisation, réessayez demain
                 </p>
+                {!isGeminiDailyPause &&
+                  dailyRemainingSec !== null &&
+                  dailyRemainingSec > 0 &&
+                  !serverQuotaAllowsResume && (
+                    <p className="text-sm">
+                      Reprise possible dans {formatRemaining(dailyRemainingSec)}
+                    </p>
+                  )}
                 <button
                   type="button"
                   onClick={() => void onResumeExtract()}
-                  disabled={busy || extractBusy}
+                  disabled={busy || extractBusy || !canResumeDaily}
                   className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
                 >
                   Reprendre l&apos;extraction

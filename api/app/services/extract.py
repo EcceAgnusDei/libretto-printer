@@ -232,6 +232,26 @@ def resume_job(session_id: str) -> dict:
             detail="Extraction déjà terminée — rien à reprendre",
         )
 
+    wait = job.get("wait") if isinstance(job.get("wait"), dict) else {}
+    source = wait.get("source")
+    # Quota serveur (ou legacy sans source) : re-vérifier le plafond AVANT running.
+    # source=gemini : ne pas bloquer sur le compteur local (branche distincte).
+    if source != "gemini":
+        try:
+            usage_quota.assert_under_daily_limit()
+        except GeminiDailyQuotaError:
+            job["status"] = "paused"
+            job["error"] = MSG_DAILY_QUOTA
+            job["wait"] = {
+                "reason": "daily",
+                "message": MSG_DAILY_QUOTA,
+                "wait_seconds": None,
+                "wait_until": usage_quota.next_reset_iso(),
+                "source": "server",
+            }
+            _save_job(job)
+            raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
+
     job["status"] = "running"
     job["error"] = None
     job["wait"] = None
@@ -282,13 +302,16 @@ def _pause_for_daily_quota(
     exc: GeminiDailyQuotaError,
 ) -> None:
     source = exc.source
+    wait_until = (
+        usage_quota.next_reset_iso() if source == "server" else None
+    )
     job["status"] = "paused"
     job["error"] = MSG_DAILY_QUOTA
     job["wait"] = {
         "reason": "daily",
         "message": MSG_DAILY_QUOTA,
         "wait_seconds": None,
-        "wait_until": None,
+        "wait_until": wait_until,
         "source": source,
     }
     _save_job(job)

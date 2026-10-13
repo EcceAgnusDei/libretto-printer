@@ -36,16 +36,61 @@ export async function fetchPublicConfig(): Promise<PublicConfig> {
   };
 }
 
-export type QuotaCheck = {
-  requiresConfirmation: boolean;
-  batchesNeeded: number;
+export type QuotaUsage = {
   batchesRemaining: number | null;
   batchesLimit: number;
   batchesUsed: number;
   batchSize: number;
+  nextResetAt: string | null;
+  quotaTimezone: string | null;
+};
+
+export type QuotaCheck = QuotaUsage & {
+  requiresConfirmation: boolean;
+  batchesNeeded: number;
   pageCount: number;
   message: string | null;
 };
+
+function mapQuotaUsage(data: {
+  batches_remaining?: number | null;
+  batches_limit?: number;
+  batches_used?: number;
+  batch_size?: number;
+  next_reset_at?: string | null;
+  quota_timezone?: string | null;
+}): QuotaUsage {
+  return {
+    batchesRemaining:
+      data.batches_remaining === null || data.batches_remaining === undefined
+        ? null
+        : Number(data.batches_remaining),
+    batchesLimit: Number(data.batches_limit ?? 0),
+    batchesUsed: Number(data.batches_used ?? 0),
+    batchSize: Number(data.batch_size ?? 5),
+    nextResetAt:
+      typeof data.next_reset_at === "string" ? data.next_reset_at : null,
+    quotaTimezone:
+      typeof data.quota_timezone === "string" ? data.quota_timezone : null,
+  };
+}
+
+export async function fetchQuotaUsage(): Promise<QuotaUsage> {
+  const res = await fetch(`${apiBase()}/quota`);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  return mapQuotaUsage(
+    (await res.json()) as {
+      batches_remaining?: number | null;
+      batches_limit?: number;
+      batches_used?: number;
+      batch_size?: number;
+      next_reset_at?: string | null;
+      quota_timezone?: string | null;
+    },
+  );
+}
 
 export async function fetchQuotaForPages(
   pageCount: number,
@@ -64,18 +109,14 @@ export async function fetchQuotaForPages(
     batches_used?: number;
     batch_size?: number;
     page_count?: number;
+    next_reset_at?: string | null;
+    quota_timezone?: string | null;
     message?: string | null;
   };
   return {
+    ...mapQuotaUsage(data),
     requiresConfirmation: Boolean(data.requires_confirmation),
     batchesNeeded: Number(data.batches_needed ?? 0),
-    batchesRemaining:
-      data.batches_remaining === null || data.batches_remaining === undefined
-        ? null
-        : Number(data.batches_remaining),
-    batchesLimit: Number(data.batches_limit ?? 0),
-    batchesUsed: Number(data.batches_used ?? 0),
-    batchSize: Number(data.batch_size ?? 5),
     pageCount: Number(data.page_count ?? pageCount),
     message: data.message ?? null,
   };

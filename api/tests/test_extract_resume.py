@@ -234,7 +234,63 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertEqual(job["status"], "paused")
         self.assertEqual(job["pages_done"], 2)
         self.assertEqual(job["wait"]["source"], "server")
+        self.assertIsNotNone(job["wait"]["wait_until"])
         self.assertIn("Lot 1", extract_service.read_libretto(session_id))
+
+    def test_resume_server_blocked_while_local_quota_exhausted(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, source="server")
+        settings.gemini_max_batches_per_day = 1
+        from app.services import usage_quota
+
+        usage_quota.reserve_batch()
+
+        with self.assertRaises(HTTPException) as ctx:
+            extract_service.resume_job(session_id)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.detail, MSG_DAILY_QUOTA)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "paused")
+        self.assertEqual(job["pages_done"], 2)
+        self.assertEqual(job["wait"]["source"], "server")
+        self.assertIsNotNone(job["wait"]["wait_until"])
+        self.assertIn("Texte partiel", extract_service.read_libretto(session_id))
+
+    def test_resume_gemini_source_ignores_local_quota(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, source="gemini")
+        settings.gemini_max_batches_per_day = 1
+        from app.services import usage_quota
+
+        usage_quota.reserve_batch()
+
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            job = extract_service.resume_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["pages_done"], 2)
+
+    def test_pause_server_sets_wait_until_utc_midnight(self) -> None:
+        from app.services import usage_quota
+
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=0, status="running")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["wait"] = None
+        job["error"] = None
+
+        extract_service._pause_for_daily_quota(
+            session_id,
+            job,
+            GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server"),
+        )
+        saved = extract_service._load_job(session_id)
+        assert saved is not None
+        self.assertEqual(saved["wait"]["wait_until"], usage_quota.next_reset_iso())
+        self.assertEqual(saved["wait"]["source"], "server")
 
     def test_resume_then_run_continues_from_pages_done(self) -> None:
         session_id = self._make_session(4)

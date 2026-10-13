@@ -4,6 +4,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +107,31 @@ class UsageQuotaBatchesTests(unittest.TestCase):
     def test_no_confirmation_when_enough(self) -> None:
         check = usage_quota.needs_over_quota_confirmation(10)  # 2 batches, limit 3
         self.assertFalse(check["requires_confirmation"])
+
+    def test_next_reset_at_is_next_utc_midnight(self) -> None:
+        reset = usage_quota.next_reset_at()
+        now = datetime.now(timezone.utc)
+        self.assertEqual(reset.tzinfo, timezone.utc)
+        self.assertEqual(reset.hour, 0)
+        self.assertEqual(reset.minute, 0)
+        self.assertEqual(reset.second, 0)
+        self.assertGreater(reset, now)
+        self.assertEqual(reset.date(), now.date() + timedelta(days=1))
+
+    def test_get_usage_exposes_reset_metadata(self) -> None:
+        usage = usage_quota.get_usage()
+        self.assertEqual(usage["quota_timezone"], "UTC")
+        self.assertEqual(usage["next_reset_at"], usage_quota.next_reset_iso())
+        self.assertEqual(usage["date"], usage_quota._today())
+
+    def test_atomic_save_replaces_usage_file(self) -> None:
+        usage_quota.reserve_batch()
+        path = usage_quota._usage_path()
+        self.assertTrue(path.is_file())
+        raw = path.read_text(encoding="utf-8")
+        self.assertIn('"batches": 1', raw)
+        leftovers = list(settings.data_dir.glob(".gemini_usage.*.tmp"))
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

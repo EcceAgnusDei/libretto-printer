@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
+import tempfile
 import threading
-from datetime import date, datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config import settings
 from app.services.gemini_errors import GeminiDailyQuotaError, MSG_DAILY_QUOTA
 
 _lock = threading.Lock()
+logger = logging.getLogger(__name__)
+_warned_unlimited = False
+
+# Compteur local = garde-fou coût machine unique (trusted), pas un contrôle d'accès multi-tenant.
+QUOTA_TIMEZONE = "UTC"
 
 
 def _usage_path() -> Path:
@@ -17,7 +25,23 @@ def _usage_path() -> Path:
 
 
 def _today() -> str:
-    return date.today().isoformat()
+    """Jour civil UTC — doit rester aligné avec next_reset_at()."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def next_reset_at() -> datetime:
+    """Prochain minuit UTC (même référentiel que _today)."""
+    today = datetime.now(timezone.utc).date()
+    return datetime(
+        today.year,
+        today.month,
+        today.day,
+        tzinfo=timezone.utc,
+    ) + timedelta(days=1)
+
+
+def next_reset_iso() -> str:
+    return next_reset_at().isoformat()
 
 
 def _load_unlocked() -> dict:
@@ -41,9 +65,27 @@ def _load_unlocked() -> dict:
 
 
 def _save_unlocked(data: dict) -> None:
+    """Écriture atomique (tmp + replace) pour éviter un reset à 0 si crash mid-write."""
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     path = _usage_path()
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    payload = json.dumps(data, indent=2)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(settings.data_dir),
+        prefix=".gemini_usage.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def batches_needed(page_count: int, batch_size: int | None = None) -> int:
@@ -53,10 +95,22 @@ def batches_needed(page_count: int, batch_size: int | None = None) -> int:
     return math.ceil(page_count / size)
 
 
+def _warn_if_unlimited(limit: int) -> None:
+    global _warned_unlimited
+    if limit > 0 or _warned_unlimited:
+        return
+    _warned_unlimited = True
+    logger.warning(
+        "gemini_max_batches_per_day=%s : plafond serveur désactivé (illimité)",
+        limit,
+    )
+
+
 def get_usage() -> dict:
     with _lock:
         data = _load_unlocked()
     limit = settings.gemini_max_batches_per_day
+    _warn_if_unlimited(limit)
     used = int(data["batches"])
     if limit <= 0:
         remaining = None
@@ -68,6 +122,8 @@ def get_usage() -> dict:
         "batches_limit": limit,
         "batches_remaining": remaining,
         "batch_size": settings.batch_size,
+        "next_reset_at": next_reset_iso(),
+        "quota_timezone": QUOTA_TIMEZONE,
     }
 
 
@@ -95,7 +151,7 @@ def reserve_batch() -> None:
 
 
 def record_batch() -> None:
-    """Incrémente le compteur journalier d'un lot Gemini consommé (sans vérifier le plafond)."""
+    """Incrémente sans plafond — réservé aux tests ; le worker doit utiliser reserve_batch()."""
     with _lock:
         data = _load_unlocked()
         data["batches"] = int(data["batches"]) + 1
@@ -122,6 +178,8 @@ def needs_over_quota_confirmation(page_count: int) -> dict:
         "batches_used": usage["batches_used"],
         "batch_size": usage["batch_size"],
         "page_count": page_count,
+        "next_reset_at": usage["next_reset_at"],
+        "quota_timezone": usage["quota_timezone"],
         "message": (
             (
                 f"Ce PDF nécessite {needed} lot(s), mais il ne reste que "
