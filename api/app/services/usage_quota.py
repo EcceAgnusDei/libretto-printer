@@ -79,7 +79,7 @@ def assert_under_daily_limit() -> None:
     with _lock:
         data = _load_unlocked()
         if data["batches"] >= limit:
-            raise GeminiDailyQuotaError(MSG_DAILY_QUOTA)
+            raise GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server")
 
 
 def reserve_batch() -> None:
@@ -88,7 +88,7 @@ def reserve_batch() -> None:
     with _lock:
         data = _load_unlocked()
         if limit > 0 and data["batches"] >= limit:
-            raise GeminiDailyQuotaError(MSG_DAILY_QUOTA)
+            raise GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server")
         data["batches"] = int(data["batches"]) + 1
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         _save_unlocked(data)

@@ -24,9 +24,10 @@ from app.services.gemini_errors import (
 
 logger = logging.getLogger(__name__)
 
-# running | done | error — plus de "started" (fusionné dans running)
+# running | paused | done | error — plus de "started" (fusionné dans running)
 ACTIVE_STATUSES = frozenset({"running"})
-_VALID_STATUSES = frozenset({"running", "done", "error"})
+RESUMABLE_STATUSES = frozenset({"paused"})
+_VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
 _H2_RE = re.compile(r"(?m)^##[ \t]")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
@@ -196,6 +197,49 @@ def start_job(session_id: str) -> dict:
     return job
 
 
+def resume_job(session_id: str) -> dict:
+    """Reprend une extraction pausée (quota journalier) sans effacer le progrès."""
+    assert_preconditions(session_id)
+
+    job = _load_job(session_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucune extraction démarrée pour cette session",
+        )
+    job = _normalize_job(job)
+
+    if job.get("status") in ACTIVE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Extraction déjà en cours (status={job['status']})",
+        )
+
+    if not _is_daily_resumable(job):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Aucune pause quota journalier à reprendre "
+                f"(status={job.get('status')})"
+            ),
+        )
+
+    pages_done = int(job.get("pages_done") or 0)
+    page_count = int(job.get("pdf_page_count") or 0)
+    if page_count < 1 or pages_done >= page_count:
+        raise HTTPException(
+            status_code=400,
+            detail="Extraction déjà terminée — rien à reprendre",
+        )
+
+    job["status"] = "running"
+    job["error"] = None
+    job["wait"] = None
+    _save_job(job)
+    _spawn_worker(session_id)
+    return job
+
+
 def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
     job = _load_job(session_id)
     if job is None:
@@ -213,10 +257,47 @@ def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
                 if wait_seconds is not None and wait_seconds > 0
                 else None
             ),
+            "source": signal.source,
         }
         if signal.kind == "daily":
+            job["status"] = "paused"
             job["error"] = MSG_DAILY_QUOTA
     _save_job(job)
+
+
+def _is_daily_resumable(job: dict) -> bool:
+    """paused, ou ancien error+daily encore présent sur disque."""
+    status = job.get("status")
+    if status in RESUMABLE_STATUSES:
+        return True
+    wait = job.get("wait")
+    if not isinstance(wait, dict):
+        return False
+    return status == "error" and wait.get("reason") == "daily"
+
+
+def _pause_for_daily_quota(
+    session_id: str,
+    job: dict,
+    exc: GeminiDailyQuotaError,
+) -> None:
+    source = exc.source
+    job["status"] = "paused"
+    job["error"] = MSG_DAILY_QUOTA
+    job["wait"] = {
+        "reason": "daily",
+        "message": MSG_DAILY_QUOTA,
+        "wait_seconds": None,
+        "wait_until": None,
+        "source": source,
+    }
+    _save_job(job)
+    logger.warning(
+        "Extract daily quota session=%s source=%s: %s",
+        session_id[:8],
+        source,
+        exc,
+    )
 
 
 def _pace_before_gemini(_session_id: str) -> None:
@@ -354,17 +435,8 @@ def run_extraction(session_id: str) -> None:
         _save_job(job)
         logger.info("Extract done session=%s", session_id[:8])
     except GeminiDailyQuotaError as exc:
-        logger.warning("Extract daily quota session=%s: %s", session_id[:8], exc)
         job = _load_job(session_id) or job
-        job["status"] = "error"
-        job["error"] = MSG_DAILY_QUOTA
-        job["wait"] = {
-            "reason": "daily",
-            "message": MSG_DAILY_QUOTA,
-            "wait_seconds": None,
-            "wait_until": None,
-        }
-        _save_job(job)
+        _pause_for_daily_quota(session_id, job, exc)
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
         logger.exception("Extract failed session=%s", session_id[:8])
         job = _load_job(session_id) or job

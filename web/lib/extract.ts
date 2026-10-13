@@ -2,15 +2,18 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
 
-export type ExtractJobStatus = "running" | "done" | "error";
+export type ExtractJobStatus = "running" | "paused" | "done" | "error";
 
 export type ExtractWaitReason = "rate_limit" | "daily";
+
+export type ExtractWaitSource = "server" | "gemini";
 
 export type ExtractWaitInfo = {
   reason: ExtractWaitReason;
   message: string;
   waitSeconds: number | null;
   waitUntil: string | null;
+  source: ExtractWaitSource | null;
 };
 
 export type ExtractStartResult = {
@@ -46,6 +49,7 @@ function mapWait(
         message: string;
         wait_seconds?: number | null;
         wait_until?: string | null;
+        source?: ExtractWaitSource | null;
       }
     | null
     | undefined,
@@ -56,6 +60,40 @@ function mapWait(
     message: wait.message,
     waitSeconds: wait.wait_seconds ?? null,
     waitUntil: wait.wait_until ?? null,
+    source: wait.source ?? null,
+  };
+}
+
+type ExtractApiPayload = {
+  session_id: string;
+  status: ExtractJobStatus;
+  source_name: string;
+  pdf_page_count: number;
+  batch_size: number;
+  total_batches: number;
+  pages_done: number;
+  current_batch: number;
+  wait?: {
+    reason: ExtractWaitReason;
+    message: string;
+    wait_seconds?: number | null;
+    wait_until?: string | null;
+    source?: ExtractWaitSource | null;
+  } | null;
+};
+
+function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
+  return {
+    sessionId: data.session_id,
+    status: data.status,
+    sourceName: data.source_name,
+    pdfPageCount: data.pdf_page_count,
+    renderedCount: data.pdf_page_count,
+    batchSize: data.batch_size,
+    totalBatches: data.total_batches,
+    pagesDone: data.pages_done,
+    currentBatch: data.current_batch,
+    wait: mapWait(data.wait),
   };
 }
 
@@ -171,34 +209,19 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
   if (!res.ok) {
     throw new Error(await readError(res));
   }
-  const data = (await res.json()) as {
-    session_id: string;
-    status: ExtractJobStatus;
-    source_name: string;
-    pdf_page_count: number;
-    batch_size: number;
-    total_batches: number;
-    pages_done: number;
-    current_batch: number;
-    wait?: {
-      reason: ExtractWaitReason;
-      message: string;
-      wait_seconds?: number | null;
-      wait_until?: string | null;
-    } | null;
-  };
-  return {
-    sessionId: data.session_id,
-    status: data.status,
-    sourceName: data.source_name,
-    pdfPageCount: data.pdf_page_count,
-    renderedCount: data.pdf_page_count,
-    batchSize: data.batch_size,
-    totalBatches: data.total_batches,
-    pagesDone: data.pages_done,
-    currentBatch: data.current_batch,
-    wait: mapWait(data.wait),
-  };
+  return mapStartLike((await res.json()) as ExtractApiPayload);
+}
+
+export async function resumeExtraction(
+  sessionId: string,
+): Promise<ExtractStartResult> {
+  const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/resume`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return mapStartLike((await res.json()) as ExtractApiPayload);
 }
 
 /** Best-effort rollback if triggerExtraction fails mid-flight. */
@@ -261,6 +284,7 @@ export async function fetchExtractStatus(
       message: string;
       wait_seconds?: number | null;
       wait_until?: string | null;
+      source?: ExtractWaitSource | null;
     } | null;
   };
   return {

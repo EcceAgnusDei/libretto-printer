@@ -17,11 +17,13 @@ def _wait_from_job(job: dict) -> ExtractWaitInfo | None:
     wait = job.get("wait")
     if not isinstance(wait, dict) or not wait.get("reason"):
         return None
+    source = wait.get("source")
     return ExtractWaitInfo(
         reason=wait["reason"],
         message=wait.get("message") or "",
         wait_seconds=wait.get("wait_seconds"),
         wait_until=wait.get("wait_until"),
+        source=source if source in {"server", "gemini"} else None,
     )
 
 
@@ -30,12 +32,7 @@ def _batch_size_from_job(job: dict) -> int | None:
     return int(value) if value is not None else None
 
 
-@router.post(
-    "/sessions/{session_id}/start",
-    response_model=ExtractStartResponse,
-)
-def start_extract(session_id: str):
-    job = extract_service.start_job(session_id)
+def _start_like_response(job: dict) -> ExtractStartResponse:
     return ExtractStartResponse(
         session_id=job["session_id"],
         status=job["status"],
@@ -47,6 +44,22 @@ def start_extract(session_id: str):
         current_batch=job["current_batch"],
         wait=_wait_from_job(job),
     )
+
+
+@router.post(
+    "/sessions/{session_id}/start",
+    response_model=ExtractStartResponse,
+)
+def start_extract(session_id: str):
+    return _start_like_response(extract_service.start_job(session_id))
+
+
+@router.post(
+    "/sessions/{session_id}/resume",
+    response_model=ExtractStartResponse,
+)
+def resume_extract(session_id: str):
+    return _start_like_response(extract_service.resume_job(session_id))
 
 
 @router.get(

@@ -110,7 +110,7 @@ def _handle_quota_and_maybe_wait(
         return False
 
     if signal.kind == "daily":
-        raise GeminiDailyQuotaError(signal.message) from exc
+        raise GeminiDailyQuotaError(signal.message, source="gemini") from exc
 
     wait_seconds = float(signal.wait_seconds or fallback)
     if wait_seconds < 1.0:

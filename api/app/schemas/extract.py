@@ -4,8 +4,9 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-ExtractStatus = Literal["running", "done", "error"]
+ExtractStatus = Literal["running", "paused", "done", "error"]
 WaitReason = Literal["rate_limit", "daily"]
+WaitSource = Literal["server", "gemini"]
 
 
 class ExtractWaitInfo(BaseModel):
@@ -13,6 +14,7 @@ class ExtractWaitInfo(BaseModel):
     message: str
     wait_seconds: float | None = None
     wait_until: str | None = None
+    source: WaitSource | None = None
 
 
 class ExtractStartResponse(BaseModel):

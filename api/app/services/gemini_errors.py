@@ -9,6 +9,7 @@ MSG_RATE_LIMIT = "forte affluence : extraction ralentie"
 MSG_DAILY_QUOTA = "dépassement des quota d'utilisation, réessayez demain"
 
 QuotaKind = Literal["rate_limit", "daily"]
+QuotaSource = Literal["server", "gemini"]
 
 _RETRY_DELAY_RE = re.compile(
     r"(?:retry(?:\s+in)?|Please retry in)\s*([0-9]+(?:\.[0-9]+)?)\s*s",
@@ -23,14 +24,21 @@ class QuotaSignal:
     wait_seconds: float | None
     message: str
     raw_quota_id: str | None = None
+    source: QuotaSource | None = None
 
 
 class GeminiDailyQuotaError(Exception):
     """Quota journalier Gemini ou serveur — ne pas retry aujourd'hui."""
 
-    def __init__(self, message: str = MSG_DAILY_QUOTA):
+    def __init__(
+        self,
+        message: str = MSG_DAILY_QUOTA,
+        *,
+        source: QuotaSource | None = None,
+    ):
         super().__init__(message)
         self.user_message = message
+        self.source = source
 
 
 class GeminiRateLimitError(Exception):

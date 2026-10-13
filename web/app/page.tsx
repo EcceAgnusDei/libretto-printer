@@ -13,6 +13,7 @@ import {
 import {
   fetchExtractStatus,
   fetchLibretto,
+  resumeExtraction,
   triggerExtraction,
   type ExtractStartResult,
   type ExtractStatusResult,
@@ -82,7 +83,9 @@ export default function Home() {
   useEffect(() => {
     if (!job) return;
     const terminal =
-      liveStatus?.status === "done" || liveStatus?.status === "error";
+      liveStatus?.status === "done" ||
+      liveStatus?.status === "error" ||
+      liveStatus?.status === "paused";
     if (terminal) return;
 
     let cancelled = false;
@@ -97,7 +100,6 @@ export default function Home() {
           if (!cancelled) setLibrettoMd(lib.markdown);
         }
         if (status.status === "error") {
-          // Quota journalier : déjà affiché dans le bandeau de statut
           const isDaily =
             status.wait?.reason === "daily" ||
             status.error ===
@@ -282,9 +284,36 @@ export default function Home() {
   const wait = status?.wait ?? null;
   const isRateWait = wait?.reason === "rate_limit";
   const isDailyWait =
+    status?.status === "paused" ||
     wait?.reason === "daily" ||
     status?.error ===
       "dépassement des quota d'utilisation, réessayez demain";
+
+  async function onResumeExtract() {
+    if (!job || busy || extractBusy) return;
+    setError(null);
+    setPhase("extracting");
+    try {
+      const result = await resumeExtraction(job.sessionId);
+      setJob(result);
+      setLiveStatus({
+        sessionId: result.sessionId,
+        status: result.status,
+        sourceName: result.sourceName,
+        pdfPageCount: result.pdfPageCount,
+        batchSize: result.batchSize,
+        totalBatches: result.totalBatches,
+        pagesDone: result.pagesDone,
+        currentBatch: result.currentBatch,
+        error: null,
+        wait: result.wait,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Échec de la reprise");
+    } finally {
+      setPhase("idle");
+    }
+  }
 
   function formatRemaining(sec: number): string {
     const m = Math.floor(sec / 60);
@@ -482,9 +511,19 @@ export default function Home() {
               </p>
             )}
             {isDailyWait && (
-              <p className="mt-2 font-medium">
-                dépassement des quota d&apos;utilisation, réessayez demain
-              </p>
+              <div className="mt-2 space-y-2">
+                <p className="font-medium">
+                  dépassement des quota d&apos;utilisation, réessayez demain
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void onResumeExtract()}
+                  disabled={busy || extractBusy}
+                  className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
+                >
+                  Reprendre l&apos;extraction
+                </button>
+              </div>
             )}
           </section>
         )}
