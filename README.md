@@ -64,6 +64,15 @@ Limites publiques : http://localhost:8000/config
 2. `POST /ingest/sessions` → upload PDF → render PNG par lots
 3. Session : `data/sessions/{id}/source.pdf`, `pages/page_XXXX.png`, `meta.json`
 
+## Quotas & messages client
+
+- **Rate limit / affluence (RPM·TPM, 429)** → pause + `wait.reason=rate_limit` → UI : *forte affluence : extraction ralentie* (+ compte à rebours)
+- **Quota journalier serveur** : `gemini_max_batches_per_day` (défaut 250 **lots**/jour). Compteur : `data/gemini_usage.json`
+- Si lots nécessaires > lots restants → confirmation UI avant extraction
+- Quota Gemini API daily / rate limit → messages UI dédiés
+- Pace préventive silencieuse : `gemini_min_interval_seconds` (défaut 5 s)
+- `GET /quota?page_count=N` pour vérifier le reste
+
 ## Couche 3 — Extraction (passe unique)
 
 Workflow :
@@ -74,7 +83,7 @@ Workflow :
    - envoie à Gemini : images du lot + **contexte = depuis le dernier `##` jusqu’à la fin**
    - Gemini renvoie la **section Markdown mise à jour** (sans numéros de page)
    - remplace cette section dans `libretto.md`
-3. Statuts job : `started` → `running` → `done` | `error`
+3. Statuts job : `running` → `done` | `error` (plus de `started`)
 4. Fichier unique : `data/sessions/{id}/libretto.md`
 
 Endpoints :

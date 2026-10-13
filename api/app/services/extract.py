@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,20 +14,33 @@ from fastapi import HTTPException
 from app.config import settings
 from app.services import gemini_client
 from app.services import ingest as ingest_service
+from app.services import usage_quota
+from app.services.gemini_errors import (
+    GeminiDailyQuotaError,
+    MSG_DAILY_QUOTA,
+    QuotaSignal,
+    wait_until_iso,
+)
 
 logger = logging.getLogger(__name__)
 
-# started: job créé, worker pas encore parti ; running: lots en cours
-ACTIVE_STATUSES = frozenset({"started", "running"})
-_VALID_STATUSES = frozenset({"started", "running", "done", "error"})
+# running | done | error — plus de "started" (fusionné dans running)
+ACTIVE_STATUSES = frozenset({"running"})
+_VALID_STATUSES = frozenset({"running", "done", "error"})
 _H2_RE = re.compile(r"(?m)^##[ \t]")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
+_last_gemini_call_at: float | None = None
+_pace_lock = threading.Lock()
 
 
 def _normalize_job(job: dict) -> dict:
-    """Compat : anciens jobs pass1/pass2 → done/error pour l'API actuelle."""
+    """Compat : started → running ; anciens pass1/pass2 → done/error."""
     status = job.get("status")
+    if status == "started":
+        job = dict(job)
+        job["status"] = "running"
+        return job
     if status in _VALID_STATUSES:
         return job
     job = dict(job)
@@ -69,7 +83,7 @@ def _load_job(session_id: str) -> dict | None:
     path = _job_path(session_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _save_job(job: dict) -> None:
@@ -141,11 +155,13 @@ def assert_preconditions(session_id: str) -> ingest_service.SessionMeta:
         )
 
     existing = _load_job(session_id)
-    if existing and existing.get("status") in ACTIVE_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Extraction déjà en cours (status={existing['status']})",
-        )
+    if existing:
+        normalized = _normalize_job(existing)
+        if normalized.get("status") in ACTIVE_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Extraction déjà en cours (status={normalized['status']})",
+            )
 
     return meta
 
@@ -155,7 +171,7 @@ def start_job(session_id: str) -> dict:
     meta = assert_preconditions(session_id)
     assert meta.pdf_page_count is not None
 
-    batch_size = settings.extract_batch_size
+    batch_size = settings.batch_size
     page_count = meta.pdf_page_count
     now = _now_iso()
 
@@ -163,20 +179,62 @@ def start_job(session_id: str) -> dict:
 
     job = {
         "session_id": session_id,
-        "status": "started",
+        "status": "running",
         "source_name": meta.source_name,
         "pdf_page_count": page_count,
-        "extract_batch_size": batch_size,
+        "batch_size": batch_size,
         "total_batches": _total_batches(page_count, batch_size),
         "pages_done": 0,
         "current_batch": 0,
         "error": None,
+        "wait": None,
         "created_at": now,
         "updated_at": now,
     }
     _save_job(job)
     _spawn_worker(session_id)
     return job
+
+
+def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
+    job = _load_job(session_id)
+    if job is None:
+        return
+    if signal is None:
+        job["wait"] = None
+    else:
+        wait_seconds = signal.wait_seconds
+        job["wait"] = {
+            "reason": signal.kind,
+            "message": signal.message,
+            "wait_seconds": wait_seconds,
+            "wait_until": (
+                wait_until_iso(wait_seconds)
+                if wait_seconds is not None and wait_seconds > 0
+                else None
+            ),
+        }
+        if signal.kind == "daily":
+            job["error"] = MSG_DAILY_QUOTA
+    _save_job(job)
+
+
+def _pace_before_gemini(_session_id: str) -> None:
+    """Respecte gemini_min_interval_seconds entre deux appels (pace silencieuse)."""
+    global _last_gemini_call_at
+    interval = settings.gemini_min_interval_seconds
+    if interval <= 0:
+        return
+
+    with _pace_lock:
+        now = time.monotonic()
+        last = _last_gemini_call_at
+        delay = 0.0
+        if last is not None:
+            delay = interval - (now - last)
+        if delay > 0.05:
+            time.sleep(delay)
+        _last_gemini_call_at = time.monotonic()
 
 
 def get_job(session_id: str) -> dict:
@@ -232,12 +290,16 @@ def run_extraction(session_id: str) -> None:
         return
 
     page_count = int(job["pdf_page_count"])
-    batch_size = int(job["extract_batch_size"])
+    batch_size = int(job.get("batch_size") or job.get("extract_batch_size") or settings.batch_size)
     pages_done = int(job.get("pages_done") or 0)
 
     job["status"] = "running"
     job["error"] = None
+    job["wait"] = None
     _save_job(job)
+
+    def on_wait(signal: QuotaSignal | None) -> None:
+        _set_job_wait(session_id, signal)
 
     try:
         while pages_done < page_count:
@@ -264,9 +326,12 @@ def run_extraction(session_id: str) -> None:
                 len(section),
             )
 
+            _pace_before_gemini(session_id)
+            usage_quota.reserve_batch()
             updated_section = gemini_client.extract_libretto_markdown(
                 image_paths,
                 section,
+                on_wait=on_wait,
             )
             new_md = apply_section_update(current, updated_section)
             write_libretto(session_id, new_md)
@@ -277,6 +342,7 @@ def run_extraction(session_id: str) -> None:
             job["pages_done"] = pages_done
             job["current_batch"] = batch_index
             job["error"] = None
+            job["wait"] = None
             _save_job(job)
 
         job = _load_job(session_id) or job
@@ -284,11 +350,25 @@ def run_extraction(session_id: str) -> None:
         job["pages_done"] = page_count
         job["current_batch"] = int(job.get("total_batches") or 0)
         job["error"] = None
+        job["wait"] = None
         _save_job(job)
         logger.info("Extract done session=%s", session_id[:8])
+    except GeminiDailyQuotaError as exc:
+        logger.warning("Extract daily quota session=%s: %s", session_id[:8], exc)
+        job = _load_job(session_id) or job
+        job["status"] = "error"
+        job["error"] = MSG_DAILY_QUOTA
+        job["wait"] = {
+            "reason": "daily",
+            "message": MSG_DAILY_QUOTA,
+            "wait_seconds": None,
+            "wait_until": None,
+        }
+        _save_job(job)
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
         logger.exception("Extract failed session=%s", session_id[:8])
         job = _load_job(session_id) or job
         job["status"] = "error"
         job["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        job["wait"] = None
         _save_job(job)

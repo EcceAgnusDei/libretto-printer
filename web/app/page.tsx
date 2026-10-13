@@ -6,7 +6,9 @@ import { useEffect, useRef, useState } from "react";
 import {
   DEFAULT_PUBLIC_CONFIG,
   fetchPublicConfig,
+  fetchQuotaForPages,
   type PublicConfig,
+  type QuotaCheck,
 } from "../lib/apiConfig";
 import {
   fetchExtractStatus,
@@ -35,10 +37,11 @@ export default function Home() {
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(
     null,
   );
+  const [nowMs, setNowMs] = useState<number | null>(null);
+  const [quotaConfirm, setQuotaConfirm] = useState<QuotaCheck | null>(null);
 
   const busy = phase !== "idle";
-  const extractBusy =
-    liveStatus?.status === "started" || liveStatus?.status === "running";
+  const extractBusy = liveStatus?.status === "running";
 
   useEffect(() => {
     let cancelled = false;
@@ -94,7 +97,14 @@ export default function Home() {
           if (!cancelled) setLibrettoMd(lib.markdown);
         }
         if (status.status === "error") {
-          setError(status.error ?? "Extraction échouée");
+          // Quota journalier : déjà affiché dans le bandeau de statut
+          const isDaily =
+            status.wait?.reason === "daily" ||
+            status.error ===
+              "dépassement des quota d'utilisation, réessayez demain";
+          if (!isDaily) {
+            setError(status.error ?? "Extraction échouée");
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -112,6 +122,31 @@ export default function Home() {
       window.clearInterval(id);
     };
   }, [job, liveStatus?.status]);
+
+  const rateLimitWaitUntil =
+    liveStatus?.wait?.reason === "rate_limit"
+      ? (liveStatus.wait.waitUntil ?? null)
+      : null;
+
+  useEffect(() => {
+    if (!rateLimitWaitUntil) return;
+    const timeoutId = window.setTimeout(() => setNowMs(Date.now()), 0);
+    const intervalId = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(intervalId);
+    };
+  }, [rateLimitWaitUntil]);
+
+  const waitRemainingSec =
+    rateLimitWaitUntil != null && nowMs != null
+      ? Math.max(
+          0,
+          Math.ceil(
+            (new Date(rateLimitWaitUntil).getTime() - nowMs) / 1000,
+          ),
+        )
+      : null;
 
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0 || busy) return;
@@ -138,13 +173,14 @@ export default function Home() {
     }
   }
 
-  async function onExtract() {
-    if (!loaded || busy) return;
+  async function runExtraction() {
+    if (!loaded) return;
     setError(null);
     setJob(null);
     setLiveStatus(null);
     setLibrettoMd(null);
     setIngestProgress(null);
+    setQuotaConfirm(null);
     setPhase("extracting");
 
     try {
@@ -155,17 +191,48 @@ export default function Home() {
         status: result.status,
         sourceName: result.sourceName,
         pdfPageCount: result.pdfPageCount,
-        extractBatchSize: result.extractBatchSize,
+        batchSize: result.batchSize,
         totalBatches: result.totalBatches,
         pagesDone: result.pagesDone,
         currentBatch: result.currentBatch,
         error: null,
+        wait: result.wait,
       });
+      try {
+        const config = await fetchPublicConfig();
+        setLimits(config);
+      } catch {
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Échec du déclenchement");
     } finally {
       setPhase("idle");
       setIngestProgress(null);
+    }
+  }
+
+  async function onExtract() {
+    if (!loaded || busy || extractBusy) return;
+    setError(null);
+    setQuotaConfirm(null);
+
+    try {
+      const check = await fetchQuotaForPages(loaded.pageCount);
+      setLimits((prev) => ({
+        ...prev,
+        batch_size: check.batchSize,
+      }));
+      if (check.requiresConfirmation) {
+        setQuotaConfirm(check);
+        return;
+      }
+      await runExtraction();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Impossible de vérifier le quota journalier",
+      );
     }
   }
 
@@ -212,6 +279,24 @@ export default function Home() {
   const pdfPageCount = status?.pdfPageCount ?? job?.pdfPageCount ?? 0;
   const currentBatch = status?.currentBatch ?? job?.currentBatch ?? 0;
   const totalBatches = status?.totalBatches ?? job?.totalBatches ?? 0;
+  const wait = status?.wait ?? null;
+  const isRateWait = wait?.reason === "rate_limit";
+  const isDailyWait =
+    wait?.reason === "daily" ||
+    status?.error ===
+      "dépassement des quota d'utilisation, réessayez demain";
+
+  function formatRemaining(sec: number): string {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
+  }
+
+  const statusBannerClass = isDailyWait
+    ? "border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200"
+    : isRateWait
+      ? "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"
+      : "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200";
 
   return (
     <div className="flex min-h-full flex-1 justify-center px-6 py-10">
@@ -272,10 +357,45 @@ export default function Home() {
           />
         </div>
 
-        {error && (
+        {error &&
+          error !==
+            "dépassement des quota d'utilisation, réessayez demain" && (
           <p className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300">
             {error}
           </p>
+        )}
+
+        {quotaConfirm && (
+          <section className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+            <p className="font-medium">Quota journalier insuffisant</p>
+            <p className="mt-2">
+              {quotaConfirm.message ??
+                `Ce PDF nécessite ${quotaConfirm.batchesNeeded} lot(s), il reste ${quotaConfirm.batchesRemaining} lot(s) aujourd'hui. Continuer ?`}
+            </p>
+            <p className="mt-2 text-xs opacity-80">
+              {quotaConfirm.pageCount} pages → {quotaConfirm.batchesNeeded}{" "}
+              lots · reste {quotaConfirm.batchesRemaining}/
+              {quotaConfirm.batchesLimit}
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void runExtraction()}
+                disabled={busy || extractBusy}
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+              >
+                Continuer quand même
+              </button>
+              <button
+                type="button"
+                onClick={() => setQuotaConfirm(null)}
+                disabled={busy}
+                className="rounded-lg border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-100 dark:hover:bg-zinc-800"
+              >
+                Annuler
+              </button>
+            </div>
+          </section>
         )}
 
         {loaded && (
@@ -332,13 +452,19 @@ export default function Home() {
         )}
 
         {job && status && (
-          <section className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+          <section
+            className={`rounded-lg border px-4 py-3 text-sm ${statusBannerClass}`}
+          >
             <p className="font-medium">
               {status.status === "done"
                 ? "Extraction terminée"
-                : status.status === "error"
-                  ? "Extraction en erreur"
-                  : "Extraction en cours"}
+                : isDailyWait
+                  ? "Quota journalier atteint"
+                  : isRateWait
+                    ? "Extraction ralentie"
+                    : status.status === "error"
+                      ? "Extraction en erreur"
+                      : "Extraction en cours"}
             </p>
             <p className="mt-1 font-mono text-xs break-all">
               session: {job.sessionId}
@@ -347,6 +473,19 @@ export default function Home() {
               status: <span className="font-mono">{status.status}</span> · lot{" "}
               {currentBatch}/{totalBatches} · pages {pagesDone}/{pdfPageCount}
             </p>
+            {isRateWait && (
+              <p className="mt-2 font-medium">
+                forte affluence : extraction ralentie
+                {waitRemainingSec !== null
+                  ? ` — reprise dans ${formatRemaining(waitRemainingSec)}`
+                  : ""}
+              </p>
+            )}
+            {isDailyWait && (
+              <p className="mt-2 font-medium">
+                dépassement des quota d&apos;utilisation, réessayez demain
+              </p>
+            )}
           </section>
         )}
 

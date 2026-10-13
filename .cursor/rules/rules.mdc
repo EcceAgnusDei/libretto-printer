@@ -5,6 +5,7 @@ alwaysApply: true
 
 # Règles (toujours actives)
 
+- après chaque modification, vérifier et corriger les erreurs du panneau Problems / ESLint / tsc...
 - Ne mets pas de commentaires sans que je le demande
 - Lorsque je te demande de mettre un commentaire, utilise "/\*"
 - Ne crée pas de fichiers tests sans que je le demande

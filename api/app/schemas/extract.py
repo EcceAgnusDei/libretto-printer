@@ -4,7 +4,15 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-ExtractStatus = Literal["started", "running", "done", "error"]
+ExtractStatus = Literal["running", "done", "error"]
+WaitReason = Literal["rate_limit", "daily"]
+
+
+class ExtractWaitInfo(BaseModel):
+    reason: WaitReason
+    message: str
+    wait_seconds: float | None = None
+    wait_until: str | None = None
 
 
 class ExtractStartResponse(BaseModel):
@@ -12,10 +20,11 @@ class ExtractStartResponse(BaseModel):
     status: ExtractStatus
     source_name: str
     pdf_page_count: int
-    extract_batch_size: int
+    batch_size: int
     total_batches: int
     pages_done: int
     current_batch: int
+    wait: ExtractWaitInfo | None = None
 
 
 class ExtractStatusResponse(BaseModel):
@@ -23,11 +32,12 @@ class ExtractStatusResponse(BaseModel):
     status: ExtractStatus
     source_name: str
     pdf_page_count: int | None
-    extract_batch_size: int | None = None
+    batch_size: int | None = None
     total_batches: int | None = None
     pages_done: int | None = None
     current_batch: int | None = None
     error: str | None = None
+    wait: ExtractWaitInfo | None = None
     created_at: str
     updated_at: str
 

@@ -355,7 +355,7 @@ def render_pdf_batch(session_id: str, start_page: int | None = None) -> tuple[Se
     if not meta.has_pdf or meta.pdf_page_count is None:
         raise HTTPException(status_code=400, detail="Aucun PDF attaché à cette session")
 
-    batch_size = settings.ingest_batch_size
+    batch_size = settings.batch_size
     if start_page is None:
         start_page = meta.rendered_count
     if start_page < 0 or start_page >= meta.pdf_page_count:

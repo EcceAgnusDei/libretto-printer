@@ -25,7 +25,7 @@ async def create_session(source_name: str = Form(default="")):
 @router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
 async def get_session(session_id: str, offset: int = 0, limit: int = 5):
     meta = ingest_service.get_session(session_id)
-    limit = min(max(limit, 1), settings.ingest_batch_size)
+    limit = min(max(limit, 1), settings.batch_size)
     pages = ingest_service.list_pages(session_id, offset=offset, limit=limit)
     return SessionDetailResponse(
         session_id=meta.session_id,
@@ -69,7 +69,7 @@ async def render_pdf_batch(session_id: str, start_page: int | None = None):
         rendered_count=meta.rendered_count,
         pdf_page_count=meta.pdf_page_count or 0,
         done=meta.done,
-        batch_size=settings.ingest_batch_size,
+        batch_size=settings.batch_size,
     )
 
 

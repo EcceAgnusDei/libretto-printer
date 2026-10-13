@@ -1,8 +1,8 @@
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Monorepo root: api/app/config.py → ../../.env
 ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
 
 
@@ -11,16 +11,36 @@ class Settings(BaseSettings):
         env_file=ROOT_ENV,
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-3.7-flash"
     cors_origins: str = "http://localhost:3000"
     data_dir: Path = Path(__file__).resolve().parents[2] / "data"
-    ingest_batch_size: int = 5
-    extract_batch_size: int = 5
+    batch_size: int = Field(
+        default=5,
+        validation_alias=AliasChoices(
+            "BATCH_SIZE",
+            "batch_size",
+            "INGEST_BATCH_SIZE",
+            "ingest_batch_size",
+            "EXTRACT_BATCH_SIZE",
+            "extract_batch_size",
+        ),
+    )
     extract_max_retries: int = 2
     extract_retry_backoff_seconds: float = 2.0
+    gemini_min_interval_seconds: float = 5.0
+    gemini_max_batches_per_day: int = Field(
+        default=250,
+        validation_alias=AliasChoices(
+            "GEMINI_MAX_BATCHES_PER_DAY",
+            "gemini_max_batches_per_day",
+            "GEMINI_MAX_REQUESTS_PER_DAY",
+            "gemini_max_requests_per_day",
+        ),
+    )
     max_upload_bytes: int = 50 * 1024 * 1024
     max_pages_per_session: int = 500
     render_dpi: int = 150

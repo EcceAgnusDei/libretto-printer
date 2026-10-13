@@ -2,7 +2,16 @@ function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
 
-export type ExtractJobStatus = "started" | "running" | "done" | "error";
+export type ExtractJobStatus = "running" | "done" | "error";
+
+export type ExtractWaitReason = "rate_limit" | "daily";
+
+export type ExtractWaitInfo = {
+  reason: ExtractWaitReason;
+  message: string;
+  waitSeconds: number | null;
+  waitUntil: string | null;
+};
 
 export type ExtractStartResult = {
   sessionId: string;
@@ -10,10 +19,11 @@ export type ExtractStartResult = {
   sourceName: string;
   pdfPageCount: number;
   renderedCount: number;
-  extractBatchSize: number;
+  batchSize: number;
   totalBatches: number;
   pagesDone: number;
   currentBatch: number;
+  wait: ExtractWaitInfo | null;
 };
 
 export type ExtractStatusResult = {
@@ -21,12 +31,33 @@ export type ExtractStatusResult = {
   status: ExtractJobStatus;
   sourceName: string;
   pdfPageCount: number | null;
-  extractBatchSize: number | null;
+  batchSize: number | null;
   totalBatches: number | null;
   pagesDone: number | null;
   currentBatch: number | null;
   error: string | null;
+  wait: ExtractWaitInfo | null;
 };
+
+function mapWait(
+  wait:
+    | {
+        reason: ExtractWaitReason;
+        message: string;
+        wait_seconds?: number | null;
+        wait_until?: string | null;
+      }
+    | null
+    | undefined,
+): ExtractWaitInfo | null {
+  if (!wait) return null;
+  return {
+    reason: wait.reason,
+    message: wait.message,
+    waitSeconds: wait.wait_seconds ?? null,
+    waitUntil: wait.wait_until ?? null,
+  };
+}
 
 export type IngestProgress = {
   phase: "upload" | "render" | "start";
@@ -145,10 +176,16 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
     status: ExtractJobStatus;
     source_name: string;
     pdf_page_count: number;
-    extract_batch_size: number;
+    batch_size: number;
     total_batches: number;
     pages_done: number;
     current_batch: number;
+    wait?: {
+      reason: ExtractWaitReason;
+      message: string;
+      wait_seconds?: number | null;
+      wait_until?: string | null;
+    } | null;
   };
   return {
     sessionId: data.session_id,
@@ -156,10 +193,11 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
     sourceName: data.source_name,
     pdfPageCount: data.pdf_page_count,
     renderedCount: data.pdf_page_count,
-    extractBatchSize: data.extract_batch_size,
+    batchSize: data.batch_size,
     totalBatches: data.total_batches,
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
+    wait: mapWait(data.wait),
   };
 }
 
@@ -213,22 +251,29 @@ export async function fetchExtractStatus(
     status: ExtractJobStatus;
     source_name: string;
     pdf_page_count: number | null;
-    extract_batch_size: number | null;
+    batch_size: number | null;
     total_batches: number | null;
     pages_done: number | null;
     current_batch: number | null;
     error: string | null;
+    wait?: {
+      reason: ExtractWaitReason;
+      message: string;
+      wait_seconds?: number | null;
+      wait_until?: string | null;
+    } | null;
   };
   return {
     sessionId: data.session_id,
     status: data.status,
     sourceName: data.source_name,
     pdfPageCount: data.pdf_page_count,
-    extractBatchSize: data.extract_batch_size,
+    batchSize: data.batch_size,
     totalBatches: data.total_batches,
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
     error: data.error,
+    wait: mapWait(data.wait),
   };
 }
 

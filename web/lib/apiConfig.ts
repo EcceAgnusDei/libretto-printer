@@ -1,13 +1,13 @@
 export type PublicConfig = {
   max_upload_bytes: number;
   max_pages: number;
-  ingest_batch_size: number;
+  batch_size: number;
 };
 
 export const DEFAULT_PUBLIC_CONFIG: PublicConfig = {
   max_upload_bytes: 50 * 1024 * 1024,
   max_pages: 500,
-  ingest_batch_size: 5,
+  batch_size: 5,
 };
 
 function apiBase(): string {
@@ -29,9 +29,54 @@ export async function fetchPublicConfig(): Promise<PublicConfig> {
       typeof data.max_pages === "number"
         ? data.max_pages
         : DEFAULT_PUBLIC_CONFIG.max_pages,
-    ingest_batch_size:
-      typeof data.ingest_batch_size === "number"
-        ? data.ingest_batch_size
-        : DEFAULT_PUBLIC_CONFIG.ingest_batch_size,
+    batch_size:
+      typeof data.batch_size === "number"
+        ? data.batch_size
+        : DEFAULT_PUBLIC_CONFIG.batch_size,
+  };
+}
+
+export type QuotaCheck = {
+  requiresConfirmation: boolean;
+  batchesNeeded: number;
+  batchesRemaining: number | null;
+  batchesLimit: number;
+  batchesUsed: number;
+  batchSize: number;
+  pageCount: number;
+  message: string | null;
+};
+
+export async function fetchQuotaForPages(
+  pageCount: number,
+): Promise<QuotaCheck> {
+  const res = await fetch(
+    `${apiBase()}/quota?page_count=${encodeURIComponent(String(pageCount))}`,
+  );
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as {
+    requires_confirmation?: boolean;
+    batches_needed?: number;
+    batches_remaining?: number | null;
+    batches_limit?: number;
+    batches_used?: number;
+    batch_size?: number;
+    page_count?: number;
+    message?: string | null;
+  };
+  return {
+    requiresConfirmation: Boolean(data.requires_confirmation),
+    batchesNeeded: Number(data.batches_needed ?? 0),
+    batchesRemaining:
+      data.batches_remaining === null || data.batches_remaining === undefined
+        ? null
+        : Number(data.batches_remaining),
+    batchesLimit: Number(data.batches_limit ?? 0),
+    batchesUsed: Number(data.batches_used ?? 0),
+    batchSize: Number(data.batch_size ?? 5),
+    pageCount: Number(data.page_count ?? pageCount),
+    message: data.message ?? null,
   };
 }
