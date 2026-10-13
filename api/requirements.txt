@@ -6,3 +6,4 @@ python-multipart
 pymupdf
 pillow
 google-genai
+tzdata

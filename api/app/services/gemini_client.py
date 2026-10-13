@@ -16,6 +16,7 @@ from app.services.gemini_errors import (
     MSG_RATE_LIMIT,
     QuotaSignal,
     classify_gemini_error,
+    wait_until_for_gemini_daily_error,
 )
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,19 @@ def _handle_quota_and_maybe_wait(
         return False
 
     if signal.kind == "daily":
-        raise GeminiDailyQuotaError(signal.message, source="gemini") from exc
+        wait_until = wait_until_for_gemini_daily_error(exc)
+        logger.warning(
+            "Gemini daily quota — quota_id=%s wait_until=%s (%s)",
+            signal.raw_quota_id,
+            wait_until,
+            type(exc).__name__,
+        )
+        raise GeminiDailyQuotaError(
+            MSG_DAILY_QUOTA,
+            source="gemini",
+            wait_until=wait_until,
+            raw_quota_id=signal.raw_quota_id,
+        ) from exc
 
     wait_seconds = float(signal.wait_seconds or fallback)
     if wait_seconds < 1.0:

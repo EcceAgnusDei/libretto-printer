@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,8 @@ from app.services import ingest as ingest_service  # noqa: E402
 from app.services.gemini_errors import (  # noqa: E402
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_RESUME_COOLDOWN,
+    next_gemini_reset_iso,
 )
 
 
@@ -34,23 +37,28 @@ class ExtractResumeTests(unittest.TestCase):
         self._old_batch = settings.batch_size
         self._old_interval = settings.gemini_min_interval_seconds
         self._old_limit = settings.gemini_max_batches_per_day
+        self._old_cooldown = settings.extract_resume_cooldown_seconds
         settings.data_dir = Path(self._tmp.name)
         settings.sessions_dir.mkdir(parents=True, exist_ok=True)
         settings.gemini_api_key = "test-key"
         settings.batch_size = 2
         settings.gemini_min_interval_seconds = 0
         settings.gemini_max_batches_per_day = 100
+        settings.extract_resume_cooldown_seconds = 0
         extract_service._running_sessions.clear()
         extract_service._last_gemini_call_at = None
+        extract_service._resume_last_at.clear()
 
     def tearDown(self) -> None:
         extract_service._running_sessions.clear()
         extract_service._last_gemini_call_at = None
+        extract_service._resume_last_at.clear()
         settings.data_dir = self._old_data
         settings.gemini_api_key = self._old_key
         settings.batch_size = self._old_batch
         settings.gemini_min_interval_seconds = self._old_interval
         settings.gemini_max_batches_per_day = self._old_limit
+        settings.extract_resume_cooldown_seconds = self._old_cooldown
         self._tmp.cleanup()
 
     def _make_session(self, page_count: int = 4) -> str:
@@ -76,10 +84,15 @@ class ExtractResumeTests(unittest.TestCase):
         status: str = "paused",
         source: str | None = "server",
         page_count: int = 4,
+        wait_until: str | None = None,
     ) -> dict:
         now = extract_service._now_iso()
         libretto = "## Acte I\n\nTexte partiel.\n"
         extract_service.write_libretto(session_id, libretto)
+        if status in {"paused", "error"} and wait_until is None and source == "gemini":
+            wait_until = (
+                datetime.now(timezone.utc) - timedelta(minutes=1)
+            ).isoformat()
         job = {
             "session_id": session_id,
             "status": status,
@@ -96,7 +109,7 @@ class ExtractResumeTests(unittest.TestCase):
                 "reason": "daily",
                 "message": MSG_DAILY_QUOTA,
                 "wait_seconds": None,
-                "wait_until": None,
+                "wait_until": wait_until,
                 "source": source,
             }
             if status in {"paused", "error"}
@@ -178,7 +191,12 @@ class ExtractResumeTests(unittest.TestCase):
         extract_service._pause_for_daily_quota(
             session_id,
             job,
-            GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="gemini"),
+            GeminiDailyQuotaError(
+                MSG_DAILY_QUOTA,
+                source="gemini",
+                wait_until=next_gemini_reset_iso(),
+                raw_quota_id="GenerateRequestsPerDay",
+            ),
         )
         saved = extract_service._load_job(session_id)
         assert saved is not None
@@ -186,7 +204,7 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertEqual(saved["error"], MSG_DAILY_QUOTA)
         self.assertEqual(saved["wait"]["reason"], "daily")
         self.assertEqual(saved["wait"]["source"], "gemini")
-        self.assertIsNone(saved["wait"]["wait_until"])
+        self.assertEqual(saved["wait"]["wait_until"], next_gemini_reset_iso())
 
     def test_run_extraction_pauses_on_server_daily_and_keeps_checkpoint(
         self,
@@ -342,6 +360,88 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertFalse(
             extract_service._is_daily_resumable({"status": "done", "wait": None})
         )
+
+    def test_resume_gemini_blocked_before_wait_until(self) -> None:
+        session_id = self._make_session(4)
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="gemini",
+            wait_until=future,
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            extract_service.resume_job(session_id)
+        self.assertEqual(ctx.exception.status_code, 429)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "paused")
+        self.assertEqual(job["pages_done"], 2)
+        self.assertEqual(job["wait"]["source"], "gemini")
+        self.assertIn("Texte partiel", extract_service.read_libretto(session_id))
+
+    def test_resume_cooldown_blocks_rapid_retries(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, source="gemini")
+        settings.extract_resume_cooldown_seconds = 30.0
+
+        with patch.object(extract_service, "_spawn_worker"):
+            extract_service.resume_job(session_id)
+
+        self._write_partial_job(session_id, pages_done=2, source="gemini")
+        with self.assertRaises(HTTPException) as ctx:
+            extract_service.resume_job(session_id)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.detail, MSG_RESUME_COOLDOWN)
+
+    def test_run_extraction_pauses_on_gemini_daily_with_wait_until(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service.write_libretto(session_id, "")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 0,
+                "current_batch": 0,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        reset = next_gemini_reset_iso()
+
+        def fake_extract(image_paths, section, *, on_wait=None):
+            raise GeminiDailyQuotaError(
+                MSG_DAILY_QUOTA,
+                source="gemini",
+                wait_until=reset,
+                raw_quota_id="GenerateRequestsPerDay",
+            )
+
+        with (
+            patch.object(
+                extract_service.gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(extract_service.usage_quota, "reserve_batch"),
+        ):
+            extract_service.run_extraction(session_id)
+
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "paused")
+        self.assertEqual(job["pages_done"], 0)
+        self.assertEqual(job["wait"]["source"], "gemini")
+        self.assertEqual(job["wait"]["wait_until"], reset)
+        self.assertEqual(job["error"], MSG_DAILY_QUOTA)
 
 
 class UsageQuotaSourceTests(unittest.TestCase):

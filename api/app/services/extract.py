@@ -18,7 +18,10 @@ from app.services import usage_quota
 from app.services.gemini_errors import (
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_RESUME_COOLDOWN,
     QuotaSignal,
+    next_gemini_reset_iso,
+    parse_wait_until,
     wait_until_iso,
 )
 
@@ -33,6 +36,8 @@ _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
 _last_gemini_call_at: float | None = None
 _pace_lock = threading.Lock()
+_resume_lock = threading.Lock()
+_resume_last_at: dict[str, float] = {}
 
 
 def _normalize_job(job: dict) -> dict:
@@ -197,9 +202,23 @@ def start_job(session_id: str) -> dict:
     return job
 
 
+def _assert_resume_cooldown(session_id: str) -> None:
+    """Anti-spam /resume (cooldown serveur, pas contrôlé par le client)."""
+    cooldown = settings.extract_resume_cooldown_seconds
+    if cooldown <= 0:
+        return
+    now = time.monotonic()
+    with _resume_lock:
+        last = _resume_last_at.get(session_id)
+        if last is not None and (now - last) < cooldown:
+            raise HTTPException(status_code=429, detail=MSG_RESUME_COOLDOWN)
+        _resume_last_at[session_id] = now
+
+
 def resume_job(session_id: str) -> dict:
     """Reprend une extraction pausée (quota journalier) sans effacer le progrès."""
     assert_preconditions(session_id)
+    _assert_resume_cooldown(session_id)
 
     job = _load_job(session_id)
     if job is None:
@@ -248,6 +267,20 @@ def resume_job(session_id: str) -> dict:
                 "wait_seconds": None,
                 "wait_until": usage_quota.next_reset_iso(),
                 "source": "server",
+            }
+            _save_job(job)
+            raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
+    else:
+        until = parse_wait_until(wait.get("wait_until"))
+        if until is not None and datetime.now(timezone.utc) < until:
+            job["status"] = "paused"
+            job["error"] = MSG_DAILY_QUOTA
+            job["wait"] = {
+                "reason": "daily",
+                "message": MSG_DAILY_QUOTA,
+                "wait_seconds": None,
+                "wait_until": until.astimezone(timezone.utc).isoformat(),
+                "source": "gemini",
             }
             _save_job(job)
             raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
@@ -302,9 +335,12 @@ def _pause_for_daily_quota(
     exc: GeminiDailyQuotaError,
 ) -> None:
     source = exc.source
-    wait_until = (
-        usage_quota.next_reset_iso() if source == "server" else None
-    )
+    if source == "server":
+        wait_until = usage_quota.next_reset_iso()
+    elif source == "gemini":
+        wait_until = exc.wait_until or next_gemini_reset_iso()
+    else:
+        wait_until = None
     job["status"] = "paused"
     job["error"] = MSG_DAILY_QUOTA
     job["wait"] = {
@@ -316,10 +352,11 @@ def _pause_for_daily_quota(
     }
     _save_job(job)
     logger.warning(
-        "Extract daily quota session=%s source=%s: %s",
+        "Extract daily quota session=%s source=%s quota_id=%s wait_until=%s",
         session_id[:8],
         source,
-        exc,
+        getattr(exc, "raw_quota_id", None),
+        wait_until,
     )
 
 

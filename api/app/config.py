@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     )
     extract_max_retries: int = 2
     extract_retry_backoff_seconds: float = 2.0
+    extract_resume_cooldown_seconds: float = 5.0
     gemini_min_interval_seconds: float = 5.0
+    gemini_quota_timezone: str = "America/Los_Angeles"
     gemini_max_batches_per_day: int = Field(
         default=250,
         validation_alias=AliasChoices(

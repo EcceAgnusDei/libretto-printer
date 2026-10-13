@@ -343,7 +343,7 @@ export default function Home() {
     dailyWaitUntil == null ||
     (nowMs != null && nowMs >= new Date(dailyWaitUntil).getTime());
   const canResumeDaily = isGeminiDailyPause
-    ? true
+    ? dailyTimeAllowsResume
     : dailyTimeAllowsResume || serverQuotaAllowsResume;
 
   async function onResumeExtract() {
@@ -367,6 +367,23 @@ export default function Home() {
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Échec de la reprise");
+      try {
+        const status = await fetchExtractStatus(job.sessionId);
+        setLiveStatus(status);
+        setJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: status.status,
+                pagesDone: status.pagesDone ?? prev.pagesDone,
+                currentBatch: status.currentBatch ?? prev.currentBatch,
+                wait: status.wait,
+              }
+            : prev,
+        );
+      } catch {
+        /* ignore */
+      }
       if (isServerDailyPause) {
         try {
           const usage = await fetchQuotaUsage();
@@ -580,14 +597,22 @@ export default function Home() {
                 <p className="font-medium">
                   dépassement des quota d&apos;utilisation, réessayez demain
                 </p>
-                {!isGeminiDailyPause &&
+                {isGeminiDailyPause ? (
+                  <p className="text-sm">
+                    Quota Google — reset souvent à minuit Pacific (PT).
+                    {dailyRemainingSec !== null && dailyRemainingSec > 0
+                      ? ` Reprise estimée dans ${formatRemaining(dailyRemainingSec)}.`
+                      : " Vous pouvez réessayer la reprise."}
+                  </p>
+                ) : (
                   dailyRemainingSec !== null &&
                   dailyRemainingSec > 0 &&
                   !serverQuotaAllowsResume && (
                     <p className="text-sm">
                       Reprise possible dans {formatRemaining(dailyRemainingSec)}
                     </p>
-                  )}
+                  )
+                )}
                 <button
                   type="button"
                   onClick={() => void onResumeExtract()}
