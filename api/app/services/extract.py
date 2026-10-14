@@ -8,6 +8,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from fastapi import HTTPException
 
@@ -18,6 +19,7 @@ from app.services import usage_quota
 from app.services.gemini_errors import (
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     QuotaSignal,
     next_gemini_reset_iso,
@@ -26,6 +28,8 @@ from app.services.gemini_errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+JobDict = dict[str, object]
 
 # running | paused | done | error — plus de "started" (fusionné dans running)
 ACTIVE_STATUSES = frozenset({"running"})
@@ -40,7 +44,22 @@ _resume_lock = threading.Lock()
 _resume_last_at: dict[str, float] = {}
 
 
-def _normalize_job(job: dict) -> dict:
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _normalize_job(job: JobDict) -> JobDict:
     """Compat : started → running ; anciens pass1/pass2 → done/error."""
     status = job.get("status")
     if status == "started":
@@ -50,8 +69,8 @@ def _normalize_job(job: dict) -> dict:
     if status in _VALID_STATUSES:
         return job
     job = dict(job)
-    pages_done = int(job.get("pages_done") or 0)
-    page_count = int(job.get("pdf_page_count") or 0)
+    pages_done = _as_int(job.get("pages_done"))
+    page_count = _as_int(job.get("pdf_page_count"))
     if status in {"pass1", "pass2"} and page_count > 0 and pages_done >= page_count:
         job["status"] = "done"
     else:
@@ -85,17 +104,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _load_job(session_id: str) -> dict | None:
+def _load_job(session_id: str) -> JobDict | None:
     path = _job_path(session_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    try:
+        loaded = cast(object, json.loads(path.read_text(encoding="utf-8-sig")))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    job: JobDict = {}
+    for key, value in cast(dict[object, object], loaded).items():
+        job[str(key)] = value
+    return job
 
 
-def _save_job(job: dict) -> None:
+def _save_job(job: JobDict) -> None:
     job["updated_at"] = _now_iso()
-    path = _job_path(job["session_id"])
-    path.write_text(
+    path = _job_path(str(job["session_id"]))
+    _ = path.write_text(
         json.dumps(job, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -127,7 +155,7 @@ def write_libretto(session_id: str, content: str) -> None:
     text = content.strip()
     if text:
         text += "\n"
-    _libretto_path(session_id).write_text(text, encoding="utf-8")
+    _ = _libretto_path(session_id).write_text(text, encoding="utf-8")
 
 
 def apply_section_update(markdown: str, updated_section: str) -> str:
@@ -140,9 +168,25 @@ def apply_section_update(markdown: str, updated_section: str) -> str:
     return f"{prefix}{updated}\n"
 
 
-def assert_preconditions(session_id: str) -> ingest_service.SessionMeta:
+def is_worker_alive(session_id: str) -> bool:
+    with _worker_lock:
+        return session_id in _running_sessions
+
+
+def job_is_stale(job: JobDict) -> bool:
+    """running sur disque mais plus de thread worker (ex. restart API)."""
+    return job.get("status") == "running" and not is_worker_alive(
+        str(job["session_id"])
+    )
+
+
+def assert_preconditions(
+    session_id: str,
+    *,
+    allow_active: bool = False,
+) -> ingest_service.SessionMeta:
     """Vérifie que l'extraction peut démarrer."""
-    ingest_service.assert_safe_session_id(session_id)
+    _ = ingest_service.assert_safe_session_id(session_id)
 
     if not settings.gemini_configured:
         raise HTTPException(
@@ -151,8 +195,8 @@ def assert_preconditions(session_id: str) -> ingest_service.SessionMeta:
         )
 
     meta = ingest_service.get_session(session_id)
-    ingest_service.require_source_pdf(session_id)
-    ingest_service.require_pages_rendered(session_id)
+    _ = ingest_service.require_source_pdf(session_id)
+    _ = ingest_service.require_pages_rendered(session_id)
 
     if meta.pdf_page_count is None or meta.pdf_page_count < 1:
         raise HTTPException(
@@ -161,7 +205,7 @@ def assert_preconditions(session_id: str) -> ingest_service.SessionMeta:
         )
 
     existing = _load_job(session_id)
-    if existing:
+    if existing and not allow_active:
         normalized = _normalize_job(existing)
         if normalized.get("status") in ACTIVE_STATUSES:
             raise HTTPException(
@@ -172,7 +216,7 @@ def assert_preconditions(session_id: str) -> ingest_service.SessionMeta:
     return meta
 
 
-def start_job(session_id: str) -> dict:
+def start_job(session_id: str) -> JobDict:
     """Ouvre le job et lance la passe unique en arrière-plan."""
     meta = assert_preconditions(session_id)
     assert meta.pdf_page_count is not None
@@ -183,7 +227,7 @@ def start_job(session_id: str) -> dict:
 
     write_libretto(session_id, "")
 
-    job = {
+    job: JobDict = {
         "session_id": session_id,
         "status": "running",
         "source_name": meta.source_name,
@@ -215,9 +259,24 @@ def _assert_resume_cooldown(session_id: str) -> None:
         _resume_last_at[session_id] = now
 
 
-def resume_job(session_id: str) -> dict:
-    """Reprend une extraction pausée (quota journalier) sans effacer le progrès."""
-    assert_preconditions(session_id)
+def _reject_if_wait_not_elapsed(job: JobDict) -> None:
+    """Refuse la reprise/réattache tant que wait_until (disque) n'est pas passé."""
+    raw_wait = job.get("wait")
+    if not isinstance(raw_wait, dict):
+        return
+    wait = cast(JobDict, raw_wait)
+    raw_until = wait.get("wait_until")
+    until = parse_wait_until(raw_until if isinstance(raw_until, str) else None)
+    if until is None or datetime.now(timezone.utc) >= until:
+        return
+    reason = wait.get("reason")
+    detail = MSG_DAILY_QUOTA if reason == "daily" else MSG_RATE_LIMIT
+    raise HTTPException(status_code=429, detail=detail)
+
+
+def resume_job(session_id: str) -> JobDict:
+    """Reprend une pause daily, ou réattache un worker orphelin (running stale)."""
+    _ = assert_preconditions(session_id, allow_active=True)
     _assert_resume_cooldown(session_id)
 
     job = _load_job(session_id)
@@ -229,10 +288,15 @@ def resume_job(session_id: str) -> dict:
     job = _normalize_job(job)
 
     if job.get("status") in ACTIVE_STATUSES:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Extraction déjà en cours (status={job['status']})",
-        )
+        if is_worker_alive(session_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Extraction déjà en cours (status={job['status']})",
+            )
+        _reject_if_wait_not_elapsed(job)
+        _spawn_worker(session_id)
+        logger.info("Extract reattach orphan worker session=%s", session_id[:8])
+        return job
 
     if not _is_daily_resumable(job):
         raise HTTPException(
@@ -243,15 +307,16 @@ def resume_job(session_id: str) -> dict:
             ),
         )
 
-    pages_done = int(job.get("pages_done") or 0)
-    page_count = int(job.get("pdf_page_count") or 0)
+    pages_done = _as_int(job.get("pages_done"))
+    page_count = _as_int(job.get("pdf_page_count"))
     if page_count < 1 or pages_done >= page_count:
         raise HTTPException(
             status_code=400,
             detail="Extraction déjà terminée — rien à reprendre",
         )
 
-    wait = job.get("wait") if isinstance(job.get("wait"), dict) else {}
+    raw_wait = job.get("wait")
+    wait: JobDict = cast(JobDict, raw_wait) if isinstance(raw_wait, dict) else {}
     source = wait.get("source")
     # Quota serveur (ou legacy sans source) : re-vérifier le plafond AVANT running.
     # source=gemini : ne pas bloquer sur le compteur local (branche distincte).
@@ -271,7 +336,10 @@ def resume_job(session_id: str) -> dict:
             _save_job(job)
             raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
     else:
-        until = parse_wait_until(wait.get("wait_until"))
+        raw_until = wait.get("wait_until")
+        until = parse_wait_until(
+            raw_until if isinstance(raw_until, str) else None
+        )
         if until is not None and datetime.now(timezone.utc) < until:
             job["status"] = "paused"
             job["error"] = MSG_DAILY_QUOTA
@@ -318,20 +386,21 @@ def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
     _save_job(job)
 
 
-def _is_daily_resumable(job: dict) -> bool:
+def _is_daily_resumable(job: JobDict) -> bool:
     """paused, ou ancien error+daily encore présent sur disque."""
     status = job.get("status")
     if status in RESUMABLE_STATUSES:
         return True
-    wait = job.get("wait")
-    if not isinstance(wait, dict):
+    raw_wait = job.get("wait")
+    if not isinstance(raw_wait, dict):
         return False
+    wait = cast(JobDict, raw_wait)
     return status == "error" and wait.get("reason") == "daily"
 
 
 def _pause_for_daily_quota(
     session_id: str,
-    job: dict,
+    job: JobDict,
     exc: GeminiDailyQuotaError,
 ) -> None:
     source = exc.source
@@ -378,21 +447,23 @@ def _pace_before_gemini(_session_id: str) -> None:
         _last_gemini_call_at = time.monotonic()
 
 
-def get_job(session_id: str) -> dict:
-    ingest_service.assert_safe_session_id(session_id)
-    ingest_service.get_session(session_id)
+def get_job(session_id: str) -> JobDict:
+    _ = ingest_service.assert_safe_session_id(session_id)
+    _ = ingest_service.get_session(session_id)
     job = _load_job(session_id)
     if job is None:
         raise HTTPException(
             status_code=404,
             detail="Aucune extraction démarrée pour cette session",
         )
-    return _normalize_job(job)
+    normalized = _normalize_job(job)
+    normalized["stale"] = job_is_stale(normalized)
+    return normalized
 
 
 def get_libretto(session_id: str) -> str:
-    ingest_service.assert_safe_session_id(session_id)
-    ingest_service.get_session(session_id)
+    _ = ingest_service.assert_safe_session_id(session_id)
+    _ = ingest_service.get_session(session_id)
     if _load_job(session_id) is None:
         raise HTTPException(
             status_code=404,
@@ -430,9 +501,12 @@ def run_extraction(session_id: str) -> None:
     if job is None:
         return
 
-    page_count = int(job["pdf_page_count"])
-    batch_size = int(job.get("batch_size") or job.get("extract_batch_size") or settings.batch_size)
-    pages_done = int(job.get("pages_done") or 0)
+    page_count = _as_int(job.get("pdf_page_count"))
+    batch_size = _as_int(
+        job.get("batch_size") or job.get("extract_batch_size"),
+        settings.batch_size,
+    )
+    pages_done = _as_int(job.get("pages_done"))
 
     job["status"] = "running"
     job["error"] = None
@@ -489,7 +563,7 @@ def run_extraction(session_id: str) -> None:
         job = _load_job(session_id) or job
         job["status"] = "done"
         job["pages_done"] = page_count
-        job["current_batch"] = int(job.get("total_batches") or 0)
+        job["current_batch"] = _as_int(job.get("total_batches"))
         job["error"] = None
         job["wait"] = None
         _save_job(job)

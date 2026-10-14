@@ -40,7 +40,25 @@ export type ExtractStatusResult = {
   currentBatch: number | null;
   error: string | null;
   wait: ExtractWaitInfo | null;
+  stale: boolean;
 };
+
+export function statusToStartResult(
+  status: ExtractStatusResult,
+): ExtractStartResult {
+  return {
+    sessionId: status.sessionId,
+    status: status.status,
+    sourceName: status.sourceName,
+    pdfPageCount: status.pdfPageCount ?? 0,
+    renderedCount: status.pdfPageCount ?? 0,
+    batchSize: status.batchSize ?? 5,
+    totalBatches: status.totalBatches ?? 0,
+    pagesDone: status.pagesDone ?? 0,
+    currentBatch: status.currentBatch ?? 0,
+    wait: status.wait,
+  };
+}
 
 function mapWait(
   wait:
@@ -279,6 +297,7 @@ export async function fetchExtractStatus(
     pages_done: number | null;
     current_batch: number | null;
     error: string | null;
+    stale?: boolean;
     wait?: {
       reason: ExtractWaitReason;
       message: string;
@@ -298,6 +317,7 @@ export async function fetchExtractStatus(
     currentBatch: data.current_batch,
     error: data.error,
     wait: mapWait(data.wait),
+    stale: Boolean(data.stale),
   };
 }
 

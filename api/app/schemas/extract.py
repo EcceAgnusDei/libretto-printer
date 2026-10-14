@@ -40,6 +40,7 @@ class ExtractStatusResponse(BaseModel):
     current_batch: int | None = None
     error: str | None = None
     wait: ExtractWaitInfo | None = None
+    stale: bool = False
     created_at: str
     updated_at: str
 

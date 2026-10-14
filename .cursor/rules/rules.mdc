@@ -5,11 +5,12 @@ alwaysApply: true
 
 # Règles (toujours actives)
 
-- après chaque modification, vérifier et corriger les erreurs du panneau Problems / ESLint / tsc...
+- ne touche pas à todo.txt
 - Ne mets pas de commentaires sans que je le demande
 - Lorsque je te demande de mettre un commentaire, utilise "/\*"
-- Ne crée pas de fichiers tests sans que je le demande
+- Mets tous les fichiers test dans un seul dossier test, côté front et back
 - Pour créer un lien, n'utilise pas le composant Button mais un Link avec une classe hérité du variant link du composant Bouton
 - Emploie le vouvoiement
 - N'ajoute pas de code mort
 - après chaque modification apporté au code, dit quels fichiers ont été changés et pourquoi
+- quand tu écris en python, écris du code conforme à PEP 8, avec typage complet (type hints) et sans imports inutilisés

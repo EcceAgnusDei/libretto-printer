@@ -79,6 +79,7 @@ def extract_status(session_id: str):
         current_batch=job.get("current_batch"),
         error=job.get("error"),
         wait=_wait_from_job(job),
+        stale=bool(job.get("stale")),
         created_at=job["created_at"],
         updated_at=job["updated_at"],
     )

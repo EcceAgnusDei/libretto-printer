@@ -1,3 +1,5 @@
+# pyright: reportPrivateUsage=false, reportUnusedCallResult=false, reportUnknownParameterType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownVariableType=false, reportMissingParameterType=false, reportUnusedParameter=false, reportUninitializedInstanceVariable=false, reportAny=false, reportUnnecessaryTypeIgnoreComment=false
+
 from __future__ import annotations
 
 import sys
@@ -5,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import override
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -15,10 +18,13 @@ sys.path.insert(0, str(ROOT))
 
 from app.config import settings  # noqa: E402
 from app.services import extract as extract_service  # noqa: E402
+from app.services import gemini_client, usage_quota  # noqa: E402
 from app.services import ingest as ingest_service  # noqa: E402
+from app.services.extract import JobDict  # noqa: E402
 from app.services.gemini_errors import (  # noqa: E402
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     next_gemini_reset_iso,
 )
@@ -29,7 +35,22 @@ def _write_tiny_png(path: Path) -> None:
     Image.new("RGB", (8, 8), color=(200, 200, 200)).save(path, format="PNG")
 
 
+def _wait_dict(job: JobDict) -> JobDict:
+    wait = job["wait"]
+    assert isinstance(wait, dict)
+    return {str(key): value for key, value in wait.items()}
+
+
 class ExtractResumeTests(unittest.TestCase):
+    _tmp: tempfile.TemporaryDirectory[str] | None = None
+    _old_data: Path | None = None
+    _old_key: str | None = None
+    _old_batch: int | None = None
+    _old_interval: float | None = None
+    _old_limit: int | None = None
+    _old_cooldown: float | None = None
+
+    @override
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self._old_data = settings.data_dir
@@ -49,10 +70,18 @@ class ExtractResumeTests(unittest.TestCase):
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
 
+    @override
     def tearDown(self) -> None:
         extract_service._running_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
+        assert self._old_data is not None
+        assert self._old_key is not None
+        assert self._old_batch is not None
+        assert self._old_interval is not None
+        assert self._old_limit is not None
+        assert self._old_cooldown is not None
+        assert self._tmp is not None
         settings.data_dir = self._old_data
         settings.gemini_api_key = self._old_key
         settings.batch_size = self._old_batch
@@ -65,7 +94,7 @@ class ExtractResumeTests(unittest.TestCase):
         meta = ingest_service.create_session("fixture.pdf")
         session_id = meta.session_id
         session_dir = settings.sessions_dir / session_id
-        (session_dir / "source.pdf").write_bytes(b"%PDF-1.4 fixture")
+        _ = (session_dir / "source.pdf").write_bytes(b"%PDF-1.4 fixture")
         pages_dir = session_dir / "pages"
         for index in range(page_count):
             _write_tiny_png(pages_dir / f"page_{index:04d}.png")
@@ -85,7 +114,7 @@ class ExtractResumeTests(unittest.TestCase):
         source: str | None = "server",
         page_count: int = 4,
         wait_until: str | None = None,
-    ) -> dict:
+    ) -> JobDict:
         now = extract_service._now_iso()
         libretto = "## Acte I\n\nTexte partiel.\n"
         extract_service.write_libretto(session_id, libretto)
@@ -93,7 +122,7 @@ class ExtractResumeTests(unittest.TestCase):
             wait_until = (
                 datetime.now(timezone.utc) - timedelta(minutes=1)
             ).isoformat()
-        job = {
+        job: JobDict = {
             "session_id": session_id,
             "status": status,
             "source_name": "fixture.pdf",
@@ -202,9 +231,10 @@ class ExtractResumeTests(unittest.TestCase):
         assert saved is not None
         self.assertEqual(saved["status"], "paused")
         self.assertEqual(saved["error"], MSG_DAILY_QUOTA)
-        self.assertEqual(saved["wait"]["reason"], "daily")
-        self.assertEqual(saved["wait"]["source"], "gemini")
-        self.assertEqual(saved["wait"]["wait_until"], next_gemini_reset_iso())
+        wait = _wait_dict(saved)
+        self.assertEqual(wait["reason"], "daily")
+        self.assertEqual(wait["source"], "gemini")
+        self.assertEqual(wait["wait_until"], next_gemini_reset_iso())
 
     def test_run_extraction_pauses_on_server_daily_and_keeps_checkpoint(
         self,
@@ -239,11 +269,11 @@ class ExtractResumeTests(unittest.TestCase):
 
         with (
             patch.object(
-                extract_service.gemini_client,
+                gemini_client,
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(extract_service.usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "reserve_batch"),
         ):
             extract_service.run_extraction(session_id)
 
@@ -251,8 +281,10 @@ class ExtractResumeTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job["status"], "paused")
         self.assertEqual(job["pages_done"], 2)
-        self.assertEqual(job["wait"]["source"], "server")
-        self.assertIsNotNone(job["wait"]["wait_until"])
+        wait = job["wait"]
+        assert isinstance(wait, dict)
+        self.assertEqual(wait["source"], "server")
+        self.assertIsNotNone(wait["wait_until"])
         self.assertIn("Lot 1", extract_service.read_libretto(session_id))
 
     def test_resume_server_blocked_while_local_quota_exhausted(self) -> None:
@@ -271,8 +303,9 @@ class ExtractResumeTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job["status"], "paused")
         self.assertEqual(job["pages_done"], 2)
-        self.assertEqual(job["wait"]["source"], "server")
-        self.assertIsNotNone(job["wait"]["wait_until"])
+        wait = _wait_dict(job)
+        self.assertEqual(wait["source"], "server")
+        self.assertIsNotNone(wait["wait_until"])
         self.assertIn("Texte partiel", extract_service.read_libretto(session_id))
 
     def test_resume_gemini_source_ignores_local_quota(self) -> None:
@@ -307,8 +340,9 @@ class ExtractResumeTests(unittest.TestCase):
         )
         saved = extract_service._load_job(session_id)
         assert saved is not None
-        self.assertEqual(saved["wait"]["wait_until"], usage_quota.next_reset_iso())
-        self.assertEqual(saved["wait"]["source"], "server")
+        wait = _wait_dict(saved)
+        self.assertEqual(wait["wait_until"], usage_quota.next_reset_iso())
+        self.assertEqual(wait["source"], "server")
 
     def test_resume_then_run_continues_from_pages_done(self) -> None:
         session_id = self._make_session(4)
@@ -323,11 +357,11 @@ class ExtractResumeTests(unittest.TestCase):
         with (
             patch.object(extract_service, "_spawn_worker"),
             patch.object(
-                extract_service.gemini_client,
+                gemini_client,
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(extract_service.usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "reserve_batch"),
         ):
             extract_service.resume_job(session_id)
             extract_service.run_extraction(session_id)
@@ -378,7 +412,8 @@ class ExtractResumeTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job["status"], "paused")
         self.assertEqual(job["pages_done"], 2)
-        self.assertEqual(job["wait"]["source"], "gemini")
+        wait = _wait_dict(job)
+        self.assertEqual(wait["source"], "gemini")
         self.assertIn("Texte partiel", extract_service.read_libretto(session_id))
 
     def test_resume_cooldown_blocks_rapid_retries(self) -> None:
@@ -394,6 +429,171 @@ class ExtractResumeTests(unittest.TestCase):
             extract_service.resume_job(session_id)
         self.assertEqual(ctx.exception.status_code, 429)
         self.assertEqual(ctx.exception.detail, MSG_RESUME_COOLDOWN)
+
+    def test_get_job_marks_orphan_running_as_stale(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 2,
+                "current_batch": 1,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        job = extract_service.get_job(session_id)
+        self.assertTrue(job["stale"])
+
+        extract_service._running_sessions.add(session_id)
+        try:
+            job_alive = extract_service.get_job(session_id)
+            self.assertFalse(job_alive["stale"])
+        finally:
+            extract_service._running_sessions.discard(session_id)
+
+    def test_resume_reattaches_orphan_running_worker(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service.write_libretto(session_id, "## Acte I\n\nTexte.\n")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 2,
+                "current_batch": 1,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            job = extract_service.resume_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["pages_done"], 2)
+        self.assertIn("Texte", extract_service.read_libretto(session_id))
+
+    def test_resume_orphan_blocked_while_rate_limit_wait_until_future(
+        self,
+    ) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        extract_service.write_libretto(session_id, "## Acte I\n\nTexte.\n")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 2,
+                "current_batch": 1,
+                "error": None,
+                "wait": {
+                    "reason": "rate_limit",
+                    "message": MSG_RATE_LIMIT,
+                    "wait_seconds": 300,
+                    "wait_until": future,
+                    "source": "gemini",
+                },
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            with self.assertRaises(HTTPException) as ctx:
+                extract_service.resume_job(session_id)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertEqual(ctx.exception.detail, MSG_RATE_LIMIT)
+        spawn.assert_not_called()
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["pages_done"], 2)
+        wait = job.get("wait")
+        assert isinstance(wait, dict)
+        self.assertEqual(wait.get("reason"), "rate_limit")
+
+    def test_resume_orphan_allowed_after_rate_limit_wait_until_past(
+        self,
+    ) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        past = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        extract_service.write_libretto(session_id, "## Acte I\n\nTexte.\n")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 2,
+                "current_batch": 1,
+                "error": None,
+                "wait": {
+                    "reason": "rate_limit",
+                    "message": MSG_RATE_LIMIT,
+                    "wait_seconds": 12,
+                    "wait_until": past,
+                    "source": "gemini",
+                },
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            job = extract_service.resume_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["pages_done"], 2)
+
+    def test_resume_rejects_when_worker_already_alive(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 1,
+                "current_batch": 1,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        extract_service._running_sessions.add(session_id)
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                extract_service.resume_job(session_id)
+            self.assertEqual(ctx.exception.status_code, 409)
+        finally:
+            extract_service._running_sessions.discard(session_id)
 
     def test_run_extraction_pauses_on_gemini_daily_with_wait_until(self) -> None:
         session_id = self._make_session(4)
@@ -427,11 +627,11 @@ class ExtractResumeTests(unittest.TestCase):
 
         with (
             patch.object(
-                extract_service.gemini_client,
+                gemini_client,
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(extract_service.usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "reserve_batch"),
         ):
             extract_service.run_extraction(session_id)
 
@@ -439,12 +639,19 @@ class ExtractResumeTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job["status"], "paused")
         self.assertEqual(job["pages_done"], 0)
-        self.assertEqual(job["wait"]["source"], "gemini")
-        self.assertEqual(job["wait"]["wait_until"], reset)
+        wait = job["wait"]
+        assert isinstance(wait, dict)
+        self.assertEqual(wait["source"], "gemini")
+        self.assertEqual(wait["wait_until"], reset)
         self.assertEqual(job["error"], MSG_DAILY_QUOTA)
 
 
 class UsageQuotaSourceTests(unittest.TestCase):
+    _tmp: tempfile.TemporaryDirectory[str] | None = None
+    _old_data: Path | None = None
+    _old_limit: int | None = None
+
+    @override
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self._old_data = settings.data_dir
@@ -452,7 +659,11 @@ class UsageQuotaSourceTests(unittest.TestCase):
         settings.data_dir = Path(self._tmp.name)
         settings.gemini_max_batches_per_day = 1
 
+    @override
     def tearDown(self) -> None:
+        assert self._old_data is not None
+        assert self._old_limit is not None
+        assert self._tmp is not None
         settings.data_dir = self._old_data
         settings.gemini_max_batches_per_day = self._old_limit
         self._tmp.cleanup()
@@ -467,4 +678,4 @@ class UsageQuotaSourceTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()
