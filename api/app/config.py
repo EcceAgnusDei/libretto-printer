@@ -15,7 +15,11 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.7-flash"
+    gemini_model: str = "gemini-3.8-flash"
+    devlog: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DEVLOG", "devlog"),
+    )
     cors_origins: str = "http://localhost:3000"
     data_dir: Path = Path(__file__).resolve().parents[2] / "data"
     batch_size: int = Field(
@@ -32,10 +36,11 @@ class Settings(BaseSettings):
     extract_max_retries: int = 2
     extract_retry_backoff_seconds: float = 2.0
     extract_resume_cooldown_seconds: float = 5.0
+    extract_supervisor_interval_seconds: float = 5.0
     gemini_min_interval_seconds: float = 5.0
     gemini_quota_timezone: str = "America/Los_Angeles"
     gemini_max_batches_per_day: int = Field(
-        default=250,
+        default=100,
         validation_alias=AliasChoices(
             "GEMINI_MAX_BATCHES_PER_DAY",
             "gemini_max_batches_per_day",

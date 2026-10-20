@@ -274,6 +274,11 @@ class ExtractResumeTests(unittest.TestCase):
                 side_effect=fake_extract,
             ),
             patch.object(usage_quota, "reserve_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=False,
+            ),
         ):
             extract_service.run_extraction(session_id)
 
@@ -459,6 +464,19 @@ class ExtractResumeTests(unittest.TestCase):
         finally:
             extract_service._running_sessions.discard(session_id)
 
+    def test_get_job_marks_orphan_daily_pause_as_stale(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, source="server")
+        job = extract_service.get_job(session_id)
+        self.assertTrue(job["stale"])
+
+        extract_service._running_sessions.add(session_id)
+        try:
+            job_alive = extract_service.get_job(session_id)
+            self.assertFalse(job_alive["stale"])
+        finally:
+            extract_service._running_sessions.discard(session_id)
+
     def test_resume_reattaches_orphan_running_worker(self) -> None:
         session_id = self._make_session(4)
         now = extract_service._now_iso()
@@ -632,6 +650,11 @@ class ExtractResumeTests(unittest.TestCase):
                 side_effect=fake_extract,
             ),
             patch.object(usage_quota, "reserve_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=False,
+            ),
         ):
             extract_service.run_extraction(session_id)
 
@@ -644,6 +667,249 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertEqual(wait["source"], "gemini")
         self.assertEqual(wait["wait_until"], reset)
         self.assertEqual(job["error"], MSG_DAILY_QUOTA)
+
+    def test_run_extraction_auto_resumes_after_server_daily(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service.write_libretto(session_id, "")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 0,
+                "current_batch": 0,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        calls = {"n": 0}
+
+        def fake_extract(image_paths, section, *, on_wait=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "## Acte I\n\nLot 1.\n"
+            if calls["n"] == 2:
+                raise GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server")
+            return "## Acte I\n\nLot 1.\n\nLot 2.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "reserve_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=True,
+            ) as await_reset,
+        ):
+            extract_service.run_extraction(session_id)
+
+        await_reset.assert_called_once_with(session_id)
+        self.assertEqual(calls["n"], 3)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["pages_done"], 4)
+        self.assertIsNone(job["wait"])
+        self.assertIn("Lot 2", extract_service.read_libretto(session_id))
+
+    def test_run_extraction_auto_resumes_after_gemini_daily(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service.write_libretto(session_id, "")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 0,
+                "current_batch": 0,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        reset = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+
+        calls = {"n": 0}
+
+        def fake_extract(image_paths, section, *, on_wait=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise GeminiDailyQuotaError(
+                    MSG_DAILY_QUOTA,
+                    source="gemini",
+                    wait_until=reset,
+                    raw_quota_id="GenerateRequestsPerDay",
+                )
+            return f"## Acte I\n\nLot {calls['n']}.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "reserve_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=True,
+            ) as await_reset,
+        ):
+            extract_service.run_extraction(session_id)
+
+        await_reset.assert_called_once_with(session_id)
+        self.assertEqual(calls["n"], 3)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["pages_done"], 4)
+
+    def test_await_daily_quota_reset_returns_when_wait_until_past(self) -> None:
+        session_id = self._make_session(4)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=5)
+        ).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="gemini",
+            wait_until=past,
+        )
+
+        with patch.object(extract_service.time, "sleep") as sleep:
+            ok = extract_service._await_daily_quota_reset(session_id)
+
+        self.assertTrue(ok)
+        sleep.assert_not_called()
+
+    def test_try_auto_resume_reattaches_orphan_running(self) -> None:
+        session_id = self._make_session(4)
+        now = extract_service._now_iso()
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": 2,
+                "current_batch": 1,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            ok = extract_service.try_auto_resume(session_id)
+        self.assertTrue(ok)
+        spawn.assert_called_once_with(session_id)
+
+    def test_try_auto_resume_daily_when_wait_until_past(self) -> None:
+        session_id = self._make_session(4)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=5)
+        ).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="gemini",
+            wait_until=past,
+        )
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            ok = extract_service.try_auto_resume(session_id)
+        self.assertTrue(ok)
+        spawn.assert_called_once_with(session_id)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "running")
+        self.assertIsNone(job["wait"])
+
+    def test_try_auto_resume_skips_daily_before_wait_until(self) -> None:
+        session_id = self._make_session(4)
+        future = (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="gemini",
+            wait_until=future,
+        )
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            ok = extract_service.try_auto_resume(session_id)
+        self.assertFalse(ok)
+        spawn.assert_not_called()
+
+    def test_reconcile_orphaned_jobs_resumes_stale_daily(self) -> None:
+        session_id = self._make_session(4)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=5)
+        ).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="server",
+            wait_until=past,
+        )
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            count = extract_service.reconcile_orphaned_jobs()
+        self.assertEqual(count, 1)
+        spawn.assert_called_once_with(session_id)
+
+    def test_await_daily_quota_reset_sleeps_then_resumes(self) -> None:
+        session_id = self._make_session(4)
+        future = (
+            datetime.now(timezone.utc) + timedelta(seconds=45)
+        ).isoformat()
+        self._write_partial_job(
+            session_id,
+            pages_done=2,
+            source="server",
+            wait_until=future,
+        )
+
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            job = extract_service._load_job(session_id)
+            assert job is not None
+            wait = _wait_dict(job)
+            wait["wait_until"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            job["wait"] = wait
+            extract_service._save_job(job)
+
+        with (
+            patch.object(extract_service.time, "sleep", side_effect=fake_sleep),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+        ):
+            ok = extract_service._await_daily_quota_reset(session_id)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(sleeps), 1)
+        self.assertLessEqual(sleeps[0], extract_service._DAILY_WAIT_CHUNK_SECONDS)
 
 
 class UsageQuotaSourceTests(unittest.TestCase):

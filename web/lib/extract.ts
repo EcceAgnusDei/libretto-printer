@@ -230,18 +230,6 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
   return mapStartLike((await res.json()) as ExtractApiPayload);
 }
 
-export async function resumeExtraction(
-  sessionId: string,
-): Promise<ExtractStartResult> {
-  const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/resume`, {
-    method: "POST",
-  });
-  if (!res.ok) {
-    throw new Error(await readError(res));
-  }
-  return mapStartLike((await res.json()) as ExtractApiPayload);
-}
-
 /** Best-effort rollback if triggerExtraction fails mid-flight. */
 async function deleteSession(sessionId: string): Promise<void> {
   try {

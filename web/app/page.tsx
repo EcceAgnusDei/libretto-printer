@@ -7,14 +7,12 @@ import {
   DEFAULT_PUBLIC_CONFIG,
   fetchPublicConfig,
   fetchQuotaForPages,
-  fetchQuotaUsage,
   type PublicConfig,
   type QuotaCheck,
 } from "../lib/apiConfig";
 import {
   fetchExtractStatus,
   fetchLibretto,
-  resumeExtraction,
   statusToStartResult,
   triggerExtraction,
   type ExtractStartResult,
@@ -70,16 +68,37 @@ function startToStatus(result: ExtractStartResult): ExtractStatusResult {
   };
 }
 
-function statusLabel(status: ExtractStatusResult): string {
-  if (status.stale) return "Interrompue (worker perdu)";
-  if (status.status === "done") return "Terminée";
-  if (status.status === "paused" || status.wait?.reason === "daily") {
-    return "Pause quota";
+function isDailyWaitStatus(status: ExtractStatusResult): boolean {
+  return (
+    status.status === "paused" ||
+    status.wait?.reason === "daily" ||
+    status.error === "dépassement des quota d'utilisation, réessayez demain"
+  );
+}
+
+function statusHeadline(status: ExtractStatusResult): string {
+  if (status.status === "done") return "Extraction terminée";
+  if (isDailyWaitStatus(status)) {
+    return "Quota journalier atteint — l'extraction reprendra demain";
   }
-  if (status.wait?.reason === "rate_limit") return "Ralentie";
-  if (status.status === "error") return "Erreur";
-  if (status.status === "running") return "En cours";
-  return status.status;
+  if (status.stale) {
+    return "Extraction interrompue — reprise automatique";
+  }
+  if (status.wait?.reason === "rate_limit") {
+    return "Extraction ralentie — forte affluence";
+  }
+  if (status.status === "error") return "Extraction en erreur";
+  return "Extraction en cours";
+}
+
+function statusToneClass(status: ExtractStatusResult): string {
+  if (isDailyWaitStatus(status) || status.stale || status.status === "error") {
+    return "border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200";
+  }
+  if (status.wait?.reason === "rate_limit") {
+    return "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100";
+  }
+  return "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200";
 }
 
 export default function Home() {
@@ -98,17 +117,40 @@ export default function Home() {
   const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(
     null,
   );
-  const [nowMs, setNowMs] = useState<number | null>(null);
   const [quotaConfirm, setQuotaConfirm] = useState<QuotaCheck | null>(null);
-  const [serverQuotaRemaining, setServerQuotaRemaining] = useState<
-    number | null | undefined
-  >(undefined);
   const [restoring, setRestoring] = useState(true);
   const userStartedDuringRestoreRef = useRef(false);
+  const librettoSyncRef = useRef<{
+    sessionId: string;
+    pagesDone: number;
+  } | null>(null);
 
   const busy = phase !== "idle" || restoring;
   const extractBusy =
     liveStatus?.status === "running" && liveStatus.stale !== true;
+
+  async function syncLibretto(
+    sessionId: string,
+    pagesDone: number | null,
+    options?: { silent?: boolean; cancelled?: () => boolean },
+  ): Promise<void> {
+    try {
+      const lib = await fetchLibretto(sessionId);
+      if (options?.cancelled?.()) return;
+      setLibrettoMd(lib.markdown);
+      librettoSyncRef.current = {
+        sessionId,
+        pagesDone: pagesDone ?? 0,
+      };
+    } catch (err) {
+      if (options?.silent) return;
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Impossible de charger le libretto",
+      );
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -162,10 +204,13 @@ export default function Home() {
             const status = await fetchExtractStatus(sessionId);
             if (cancelled) return;
             results.push(status);
-            const previous = stored.find((entry) => entry.sessionId === sessionId);
+            const previous = stored.find(
+              (entry) => entry.sessionId === sessionId,
+            );
             keep.push({
               sessionId,
-              sourceName: status.sourceName || previous?.sourceName || sessionId,
+              sourceName:
+                status.sourceName || previous?.sourceName || sessionId,
               pdfPageCount: status.pdfPageCount ?? previous?.pdfPageCount ?? 0,
               updatedAt: new Date().toISOString(),
             });
@@ -195,19 +240,12 @@ export default function Home() {
           setJob(statusToStartResult(preferred));
           setLiveStatus(preferred);
           writeSessionIdToUrl(preferred.sessionId);
-          if (preferred.status === "done") {
-            try {
-              const lib = await fetchLibretto(preferred.sessionId);
-              if (
-                !cancelled &&
-                shouldApplyRestoredFocus(userStartedDuringRestoreRef.current)
-              ) {
-                setLibrettoMd(lib.markdown);
-              }
-            } catch {
-              /* ignore */
-            }
-          }
+          await syncLibretto(preferred.sessionId, preferred.pagesDone, {
+            silent: true,
+            cancelled: () =>
+              cancelled ||
+              !shouldApplyRestoredFocus(userStartedDuringRestoreRef.current),
+          });
         }
       } else {
         for (const entry of keep) {
@@ -240,11 +278,18 @@ export default function Home() {
   const pollSessionIds = [
     ...new Set([
       ...tracked
-        .filter((item) => item.status === "running" || item.stale)
+        .filter(
+          (item) =>
+            item.status === "running" ||
+            item.status === "paused" ||
+            item.stale,
+        )
         .map((item) => item.sessionId),
       ...(job &&
       liveStatus &&
-      (liveStatus.status === "running" || liveStatus.stale)
+      (liveStatus.status === "running" ||
+        liveStatus.status === "paused" ||
+        liveStatus.stale)
         ? [job.sessionId]
         : []),
     ]),
@@ -287,13 +332,13 @@ export default function Home() {
       setJob(statusToStartResult(selected));
       rememberFromStatus(selected);
 
-      if (selected.status === "done") {
-        try {
-          const lib = await fetchLibretto(selectedId);
-          if (!cancelled) setLibrettoMd(lib.markdown);
-        } catch {
-          /* ignore */
-        }
+      const pagesDone = selected.pagesDone ?? 0;
+      const sync = librettoSyncRef.current;
+      if (sync?.sessionId !== selectedId || sync.pagesDone !== pagesDone) {
+        await syncLibretto(selectedId, pagesDone, {
+          silent: true,
+          cancelled: () => cancelled,
+        });
       }
       if (selected.status === "error") {
         const isDaily =
@@ -314,75 +359,6 @@ export default function Home() {
     };
   }, [pollSessionIds, job?.sessionId]);
 
-  const rateLimitWaitUntil =
-    liveStatus?.wait?.reason === "rate_limit"
-      ? (liveStatus.wait.waitUntil ?? null)
-      : null;
-  const dailyWaitUntil =
-    liveStatus?.wait?.reason === "daily"
-      ? (liveStatus.wait.waitUntil ?? null)
-      : null;
-  const isServerDailyPause =
-    (liveStatus?.status === "paused" ||
-      liveStatus?.wait?.reason === "daily") &&
-    liveStatus?.wait?.source !== "gemini";
-
-  useEffect(() => {
-    const waitUntil = rateLimitWaitUntil ?? dailyWaitUntil;
-    if (!waitUntil) return;
-    const timeoutId = window.setTimeout(() => setNowMs(Date.now()), 0);
-    const intervalId = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => {
-      window.clearTimeout(timeoutId);
-      window.clearInterval(intervalId);
-    };
-  }, [rateLimitWaitUntil, dailyWaitUntil]);
-
-  useEffect(() => {
-    if (!isServerDailyPause) return;
-    let cancelled = false;
-
-    async function refreshQuota() {
-      try {
-        const usage = await fetchQuotaUsage();
-        if (!cancelled) {
-          setServerQuotaRemaining(usage.batchesRemaining);
-        }
-      } catch {
-        if (!cancelled) setServerQuotaRemaining(undefined);
-      }
-    }
-
-    void refreshQuota();
-    const id = window.setInterval(() => void refreshQuota(), 30_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [isServerDailyPause, liveStatus?.sessionId]);
-
-  const activeServerQuotaRemaining = isServerDailyPause
-    ? serverQuotaRemaining
-    : undefined;
-
-  const waitRemainingSec =
-    rateLimitWaitUntil != null && nowMs != null
-      ? Math.max(
-          0,
-          Math.ceil(
-            (new Date(rateLimitWaitUntil).getTime() - nowMs) / 1000,
-          ),
-        )
-      : null;
-
-  const dailyRemainingSec =
-    dailyWaitUntil != null && nowMs != null
-      ? Math.max(
-          0,
-          Math.ceil((new Date(dailyWaitUntil).getTime() - nowMs) / 1000),
-        )
-      : null;
-
   function applyJobSelection(status: ExtractStatusResult): void {
     setError(null);
     setJob(statusToStartResult(status));
@@ -394,16 +370,8 @@ export default function Home() {
   async function selectTracked(status: ExtractStatusResult): Promise<void> {
     applyJobSelection(status);
     setLibrettoMd(null);
-    if (status.status === "done") {
-      try {
-        const lib = await fetchLibretto(status.sessionId);
-        setLibrettoMd(lib.markdown);
-      } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Impossible de charger le libretto",
-        );
-      }
-    }
+    librettoSyncRef.current = null;
+    await syncLibretto(status.sessionId, status.pagesDone);
   }
 
   function dismissTracked(sessionId: string): void {
@@ -413,6 +381,9 @@ export default function Home() {
       setJob(null);
       setLiveStatus(null);
       setLibrettoMd(null);
+      librettoSyncRef.current = null;
+      setLoaded(null);
+      setQuotaConfirm(null);
       writeSessionIdToUrl(null);
     }
   }
@@ -423,6 +394,7 @@ export default function Home() {
     setJob(null);
     setLiveStatus(null);
     setLibrettoMd(null);
+    librettoSyncRef.current = null;
     setIngestProgress(null);
     writeSessionIdToUrl(null);
     setPhase("validating");
@@ -450,6 +422,7 @@ export default function Home() {
     setJob(null);
     setLiveStatus(null);
     setLibrettoMd(null);
+    librettoSyncRef.current = null;
     setIngestProgress(null);
     setQuotaConfirm(null);
     setPhase("extracting");
@@ -465,6 +438,11 @@ export default function Home() {
       setJob(result);
       setLiveStatus(asStatus);
       writeSessionIdToUrl(result.sessionId);
+      setLibrettoMd("");
+      librettoSyncRef.current = {
+        sessionId: result.sessionId,
+        pagesDone: result.pagesDone,
+      };
       try {
         const config = await fetchPublicConfig();
         setLimits(config);
@@ -542,87 +520,6 @@ export default function Home() {
     return "Démarrage de l'extraction…";
   }
 
-  const status = liveStatus ?? null;
-  const pagesDone = status?.pagesDone ?? job?.pagesDone ?? 0;
-  const pdfPageCount = status?.pdfPageCount ?? job?.pdfPageCount ?? 0;
-  const currentBatch = status?.currentBatch ?? job?.currentBatch ?? 0;
-  const totalBatches = status?.totalBatches ?? job?.totalBatches ?? 0;
-  const wait = status?.wait ?? null;
-  const isRateWait = wait?.reason === "rate_limit";
-  const isDailyWait =
-    status?.status === "paused" ||
-    wait?.reason === "daily" ||
-    status?.error ===
-      "dépassement des quota d'utilisation, réessayez demain";
-  const isStaleRunning = Boolean(status?.stale);
-  const isGeminiDailyPause = isDailyWait && wait?.source === "gemini";
-  const serverQuotaAllowsResume =
-    activeServerQuotaRemaining === null ||
-    (typeof activeServerQuotaRemaining === "number" &&
-      activeServerQuotaRemaining > 0);
-  const dailyTimeAllowsResume =
-    dailyWaitUntil == null ||
-    (nowMs != null && nowMs >= new Date(dailyWaitUntil).getTime());
-  const canResumeDaily = isGeminiDailyPause
-    ? dailyTimeAllowsResume
-    : dailyTimeAllowsResume || serverQuotaAllowsResume;
-  const canResume = isStaleRunning || (isDailyWait && canResumeDaily);
-
-  async function onResumeExtract() {
-    if (!job || busy || extractBusy || !canResume) return;
-    setError(null);
-    setPhase("extracting");
-    try {
-      const result = await resumeExtraction(job.sessionId);
-      const asStatus = startToStatus(result);
-      rememberFromStart(result);
-      setTracked((prev) => [
-        asStatus,
-        ...prev.filter((item) => item.sessionId !== result.sessionId),
-      ]);
-      setJob(result);
-      setLiveStatus(asStatus);
-      writeSessionIdToUrl(result.sessionId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Échec de la reprise");
-      try {
-        const nextStatus = await fetchExtractStatus(job.sessionId);
-        setLiveStatus(nextStatus);
-        setJob(statusToStartResult(nextStatus));
-        setTracked((prev) =>
-          prev.map((item) =>
-            item.sessionId === nextStatus.sessionId ? nextStatus : item,
-          ),
-        );
-        rememberFromStatus(nextStatus);
-      } catch {
-        /* ignore */
-      }
-      if (isServerDailyPause) {
-        try {
-          const usage = await fetchQuotaUsage();
-          setServerQuotaRemaining(usage.batchesRemaining);
-        } catch {
-          /* ignore */
-        }
-      }
-    } finally {
-      setPhase("idle");
-    }
-  }
-
-  function formatRemaining(sec: number): string {
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  }
-
-  const statusBannerClass = isDailyWait || isStaleRunning
-    ? "border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200"
-    : isRateWait
-      ? "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"
-      : "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200";
-
   const visibleTracked = tracked.filter(
     (item) =>
       item.status === "running" ||
@@ -662,41 +559,43 @@ export default function Home() {
             <ul className="space-y-2">
               {visibleTracked.map((item) => {
                 const selected = job?.sessionId === item.sessionId;
-                const pages = `${item.pagesDone ?? 0}/${item.pdfPageCount ?? "?"}`;
+                const pagesDone = item.pagesDone ?? 0;
+                const pdfPageCount = item.pdfPageCount ?? "?";
                 return (
                   <li
                     key={item.sessionId}
-                    className={`flex flex-col gap-2 rounded-lg border px-3 py-3 sm:flex-row sm:items-center sm:justify-between ${
-                      selected
-                        ? "border-zinc-900 dark:border-zinc-100"
-                        : "border-zinc-200 dark:border-zinc-800"
+                    className={`rounded-lg border px-3 py-3 text-sm ${statusToneClass(item)} ${
+                      selected ? "ring-2 ring-zinc-900 dark:ring-zinc-100" : ""
                     }`}
                   >
-                    <div className="min-w-0 space-y-1">
-                      <p className="truncate text-sm font-medium text-zinc-900 dark:text-zinc-50">
-                        {item.sourceName}
-                      </p>
-                      <p className="text-xs text-zinc-500">
-                        {statusLabel(item)} · pages {pages}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => void selectTracked(item)}
-                        disabled={busy}
-                        className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-800 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-100 dark:hover:bg-zinc-800"
-                      >
-                        {selected ? "Sélectionnée" : "Afficher"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => dismissTracked(item.sessionId)}
-                        disabled={busy}
-                        className="rounded-lg px-3 py-1.5 text-sm font-medium text-zinc-500 underline-offset-4 transition hover:text-zinc-800 hover:underline disabled:cursor-not-allowed disabled:opacity-50 dark:hover:text-zinc-200"
-                      >
-                        Retirer
-                      </button>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0 space-y-1">
+                        <p className="truncate font-medium">
+                          {item.sourceName}
+                        </p>
+                        <p>{statusHeadline(item)}</p>
+                        <p className="text-xs opacity-80">
+                          {pagesDone}/{pdfPageCount} pages
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void selectTracked(item)}
+                          disabled={busy}
+                          className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
+                        >
+                          {selected ? "Sélectionnée" : "Afficher"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => dismissTracked(item.sessionId)}
+                          disabled={busy}
+                          className="rounded-lg px-3 py-1.5 text-sm font-medium underline-offset-4 opacity-80 transition hover:underline hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Retirer
+                        </button>
+                      </div>
                     </div>
                   </li>
                 );
@@ -749,12 +648,11 @@ export default function Home() {
         </div>
 
         {error &&
-          error !==
-            "dépassement des quota d'utilisation, réessayez demain" && (
-          <p className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300">
-            {error}
-          </p>
-        )}
+          error !== "dépassement des quota d'utilisation, réessayez demain" && (
+            <p className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-300">
+              {error}
+            </p>
+          )}
 
         {quotaConfirm && (
           <section className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-4 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
@@ -764,8 +662,8 @@ export default function Home() {
                 `Ce PDF nécessite ${quotaConfirm.batchesNeeded} lot(s), il reste ${quotaConfirm.batchesRemaining} lot(s) aujourd'hui. Continuer ?`}
             </p>
             <p className="mt-2 text-xs opacity-80">
-              {quotaConfirm.pageCount} pages → {quotaConfirm.batchesNeeded}{" "}
-              lots · reste {quotaConfirm.batchesRemaining}/
+              {quotaConfirm.pageCount} pages → {quotaConfirm.batchesNeeded} lots
+              · reste {quotaConfirm.batchesRemaining}/
               {quotaConfirm.batchesLimit}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -789,7 +687,7 @@ export default function Home() {
           </section>
         )}
 
-        {loaded && (
+        {loaded && phase !== "extracting" && !job && (
           <section className="flex flex-col items-start gap-4 sm:flex-row sm:items-end">
             <div className="relative h-52 w-40 overflow-hidden rounded-lg border border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950">
               <Image
@@ -832,97 +730,9 @@ export default function Home() {
                 disabled={busy || extractBusy}
                 className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
               >
-                {phase === "extracting"
-                  ? extractingLabel()
-                  : extractBusy
-                    ? "Extraction en cours…"
-                    : "Extraire le libretto"}
+                Extraire le libretto
               </button>
             </div>
-          </section>
-        )}
-
-        {job && status && (
-          <section
-            className={`rounded-lg border px-4 py-3 text-sm ${statusBannerClass}`}
-          >
-            <p className="font-medium">
-              {status.status === "done"
-                ? "Extraction terminée"
-                : isStaleRunning
-                  ? "Extraction interrompue"
-                  : isDailyWait
-                    ? "Quota journalier atteint"
-                    : isRateWait
-                      ? "Extraction ralentie"
-                      : status.status === "error"
-                        ? "Extraction en erreur"
-                        : "Extraction en cours"}
-            </p>
-            <p className="mt-1 font-mono text-xs break-all">
-              session: {job.sessionId}
-            </p>
-            <p className="mt-1">
-              status: <span className="font-mono">{status.status}</span>
-              {isStaleRunning ? " (stale)" : ""} · lot {currentBatch}/
-              {totalBatches} · pages {pagesDone}/{pdfPageCount}
-            </p>
-            {isRateWait && (
-              <p className="mt-2 font-medium">
-                forte affluence : extraction ralentie
-                {waitRemainingSec !== null
-                  ? ` — reprise dans ${formatRemaining(waitRemainingSec)}`
-                  : ""}
-              </p>
-            )}
-            {isStaleRunning && (
-              <div className="mt-2 space-y-2">
-                <p className="font-medium">
-                  Le serveur n&apos;a plus de worker actif pour cette session
-                  (redémarrage probable). Vous pouvez réattacher l&apos;extraction
-                  sans perdre le progrès.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => void onResumeExtract()}
-                  disabled={busy || extractBusy}
-                  className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
-                >
-                  Reprendre l&apos;extraction
-                </button>
-              </div>
-            )}
-            {isDailyWait && !isStaleRunning && (
-              <div className="mt-2 space-y-2">
-                <p className="font-medium">
-                  dépassement des quota d&apos;utilisation, réessayez demain
-                </p>
-                {isGeminiDailyPause ? (
-                  <p className="text-sm">
-                    Quota Google — reset souvent à minuit Pacific (PT).
-                    {dailyRemainingSec !== null && dailyRemainingSec > 0
-                      ? ` Reprise estimée dans ${formatRemaining(dailyRemainingSec)}.`
-                      : " Vous pouvez réessayer la reprise."}
-                  </p>
-                ) : (
-                  dailyRemainingSec !== null &&
-                  dailyRemainingSec > 0 &&
-                  !serverQuotaAllowsResume && (
-                    <p className="text-sm">
-                      Reprise possible dans {formatRemaining(dailyRemainingSec)}
-                    </p>
-                  )
-                )}
-                <button
-                  type="button"
-                  onClick={() => void onResumeExtract()}
-                  disabled={busy || extractBusy || !canResumeDaily}
-                  className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
-                >
-                  Reprendre l&apos;extraction
-                </button>
-              </div>
-            )}
           </section>
         )}
 

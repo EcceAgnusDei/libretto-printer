@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from app.config import settings
+from app.devlog import devlog
 from app.services.gemini_errors import (
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
@@ -18,6 +19,7 @@ from app.services.gemini_errors import (
     classify_gemini_error,
     wait_until_for_gemini_daily_error,
 )
+
 logger = logging.getLogger(__name__)
 
 EXTRACT_INSTRUCTION = """Tu es un extracteur de libretto d'opéra.
@@ -194,9 +196,22 @@ def extract_libretto_markdown(
 
     last_error: BaseException | None = None
     max_attempts = max(settings.extract_max_retries + 1, 6)
+    image_labels: list[str] = []
+    if settings.devlog:
+        image_labels = [
+            f"{path.name} ({path.stat().st_size} B)" for path in image_paths
+        ]
 
     for attempt in range(max_attempts):
         try:
+            devlog(
+                "Gemini request model=%s attempt=%s/%s images=%s section_chars=%s",
+                settings.gemini_model,
+                attempt + 1,
+                max_attempts,
+                image_labels,
+                len(ctx),
+            )
             response = _get_client().models.generate_content(
                 model=settings.gemini_model,
                 contents=types.Content(role="user", parts=parts),
@@ -205,6 +220,12 @@ def extract_libretto_markdown(
             text = _strip_fences(response.text or "")
             if not text:
                 raise ValueError("Réponse Gemini vide")
+            devlog(
+                "Gemini response model=%s attempt=%s chars=%s",
+                settings.gemini_model,
+                attempt + 1,
+                len(text),
+            )
             if on_wait is not None:
                 on_wait(None)
             return text

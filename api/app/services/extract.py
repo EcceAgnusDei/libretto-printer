@@ -22,6 +22,7 @@ from app.services.gemini_errors import (
     MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     QuotaSignal,
+    next_gemini_reset_at,
     next_gemini_reset_iso,
     parse_wait_until,
     wait_until_iso,
@@ -42,6 +43,10 @@ _last_gemini_call_at: float | None = None
 _pace_lock = threading.Lock()
 _resume_lock = threading.Lock()
 _resume_last_at: dict[str, float] = {}
+_DAILY_WAIT_CHUNK_SECONDS = 30.0
+_supervisor_stop = threading.Event()
+_supervisor_thread: threading.Thread | None = None
+_supervisor_lock = threading.Lock()
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -174,10 +179,16 @@ def is_worker_alive(session_id: str) -> bool:
 
 
 def job_is_stale(job: JobDict) -> bool:
-    """running sur disque mais plus de thread worker (ex. restart API)."""
-    return job.get("status") == "running" and not is_worker_alive(
-        str(job["session_id"])
-    )
+    """
+    Worker absent alors que la session doit encore avancer :
+    running orphelin, ou pause daily sans thread d'attente (superviseur).
+    """
+    session_id = str(job["session_id"])
+    if is_worker_alive(session_id):
+        return False
+    if job.get("status") == "running":
+        return True
+    return _is_daily_resumable(job)
 
 
 def assert_preconditions(
@@ -274,10 +285,15 @@ def _reject_if_wait_not_elapsed(job: JobDict) -> None:
     raise HTTPException(status_code=429, detail=detail)
 
 
-def resume_job(session_id: str) -> JobDict:
+def resume_job(
+    session_id: str,
+    *,
+    enforce_cooldown: bool = True,
+) -> JobDict:
     """Reprend une pause daily, ou réattache un worker orphelin (running stale)."""
     _ = assert_preconditions(session_id, allow_active=True)
-    _assert_resume_cooldown(session_id)
+    if enforce_cooldown:
+        _assert_resume_cooldown(session_id)
 
     job = _load_job(session_id)
     if job is None:
@@ -361,6 +377,80 @@ def resume_job(session_id: str) -> JobDict:
     return job
 
 
+def try_auto_resume(session_id: str) -> bool:
+    """Reprise silencieuse pour le superviseur. True si un worker a été lancé."""
+    try:
+        _ = resume_job(session_id, enforce_cooldown=False)
+    except HTTPException as exc:
+        if exc.status_code in {400, 404, 409, 429, 503}:
+            return False
+        raise
+    return True
+
+
+def _list_session_ids() -> list[str]:
+    root = settings.sessions_dir
+    if not root.is_dir():
+        return []
+    return sorted(
+        path.name for path in root.iterdir() if path.is_dir() and path.name
+    )
+
+
+def reconcile_orphaned_jobs() -> int:
+    """Parcourt les sessions et relance les workers absents quand c'est possible."""
+    resumed = 0
+    for session_id in _list_session_ids():
+        job = _load_job(session_id)
+        if job is None:
+            continue
+        job = _normalize_job(job)
+        if not job_is_stale(job):
+            continue
+        if try_auto_resume(session_id):
+            resumed += 1
+    return resumed
+
+
+def _supervisor_loop() -> None:
+    interval = max(settings.extract_supervisor_interval_seconds, 1.0)
+    while not _supervisor_stop.wait(interval):
+        try:
+            count = reconcile_orphaned_jobs()
+            if count:
+                logger.info("Extract supervisor resumed %s session(s)", count)
+        except Exception:  # noqa: BLE001 — boucle superviseur ne doit pas mourir
+            logger.exception("Extract supervisor tick failed")
+
+
+def start_supervisor() -> None:
+    global _supervisor_thread
+    with _supervisor_lock:
+        if _supervisor_thread is not None and _supervisor_thread.is_alive():
+            return
+        _supervisor_stop.clear()
+        _supervisor_thread = threading.Thread(
+            target=_supervisor_loop,
+            name="extract-supervisor",
+            daemon=True,
+        )
+        _supervisor_thread.start()
+        logger.info(
+            "Extract supervisor started (interval=%.1fs)",
+            max(settings.extract_supervisor_interval_seconds, 1.0),
+        )
+
+
+def stop_supervisor() -> None:
+    global _supervisor_thread
+    with _supervisor_lock:
+        _supervisor_stop.set()
+        thread = _supervisor_thread
+        _supervisor_thread = None
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+
+
 def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
     job = _load_job(session_id)
     if job is None:
@@ -427,6 +517,78 @@ def _pause_for_daily_quota(
         getattr(exc, "raw_quota_id", None),
         wait_until,
     )
+
+
+def _await_daily_quota_reset(session_id: str) -> bool:
+    """
+    Attend wait_until d'une pause daily (serveur ou Gemini).
+
+    True = reprendre automatiquement ; False = arrêter le worker
+    (job disparu / statut non reprisable). Une reprise manuelle pendant
+    l'attente (status=running, wait vidé) fait aussi retourner True.
+    """
+    while True:
+        job = _load_job(session_id)
+        if job is None:
+            return False
+
+        if job.get("status") == "running" and not isinstance(job.get("wait"), dict):
+            return True
+
+        if not _is_daily_resumable(job):
+            return False
+
+        raw_wait = job.get("wait")
+        wait: JobDict = cast(JobDict, raw_wait) if isinstance(raw_wait, dict) else {}
+        source = wait.get("source")
+        raw_until = wait.get("wait_until")
+        until = parse_wait_until(
+            raw_until if isinstance(raw_until, str) else None
+        )
+
+        if until is None:
+            if source == "server":
+                until = usage_quota.next_reset_at()
+            else:
+                until = next_gemini_reset_at().astimezone(timezone.utc)
+            wait = dict(wait)
+            wait["wait_until"] = until.isoformat()
+            job["wait"] = wait
+            _save_job(job)
+
+        remaining = (until - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            chunk = min(remaining, _DAILY_WAIT_CHUNK_SECONDS)
+            logger.info(
+                "Extract daily wait session=%s remaining=%.0fs source=%s",
+                session_id[:8],
+                remaining,
+                source,
+            )
+            time.sleep(chunk)
+            continue
+
+        if source != "gemini":
+            try:
+                usage_quota.assert_under_daily_limit()
+            except GeminiDailyQuotaError:
+                wait = dict(wait)
+                wait["reason"] = "daily"
+                wait["message"] = MSG_DAILY_QUOTA
+                wait["wait_seconds"] = None
+                wait["wait_until"] = usage_quota.next_reset_iso()
+                wait["source"] = "server"
+                job["status"] = "paused"
+                job["error"] = MSG_DAILY_QUOTA
+                job["wait"] = wait
+                _save_job(job)
+                continue
+
+        logger.info(
+            "Extract daily wait elapsed session=%s — auto-resume",
+            session_id[:8],
+        )
+        return True
 
 
 def _pace_before_gemini(_session_id: str) -> None:
@@ -518,47 +680,60 @@ def run_extraction(session_id: str) -> None:
 
     try:
         while pages_done < page_count:
-            start = pages_done
-            end = min(start + batch_size, page_count)
-            batch_index = (start // batch_size) + 1
-            page_indices = list(range(start, end))
-            image_paths = [_page_png_path(session_id, i) for i in page_indices]
-            missing = [str(p) for p in image_paths if not p.is_file()]
-            if missing:
-                raise FileNotFoundError(
-                    f"Pages PNG manquantes pour le lot {batch_index}: {missing[:3]}"
+            try:
+                start = pages_done
+                end = min(start + batch_size, page_count)
+                batch_index = (start // batch_size) + 1
+                page_indices = list(range(start, end))
+                image_paths = [_page_png_path(session_id, i) for i in page_indices]
+                missing = [str(p) for p in image_paths if not p.is_file()]
+                if missing:
+                    raise FileNotFoundError(
+                        f"Pages PNG manquantes pour le lot {batch_index}: "
+                        f"{missing[:3]}"
+                    )
+
+                current = read_libretto(session_id)
+                _prefix, section = split_current_section(current)
+
+                logger.info(
+                    "Extract session=%s batch=%s pages=%s-%s section_chars=%s",
+                    session_id[:8],
+                    batch_index,
+                    start + 1,
+                    end,
+                    len(section),
                 )
 
-            current = read_libretto(session_id)
-            _prefix, section = split_current_section(current)
+                _pace_before_gemini(session_id)
+                usage_quota.reserve_batch()
+                updated_section = gemini_client.extract_libretto_markdown(
+                    image_paths,
+                    section,
+                    on_wait=on_wait,
+                )
+                new_md = apply_section_update(current, updated_section)
+                write_libretto(session_id, new_md)
 
-            logger.info(
-                "Extract session=%s batch=%s pages=%s-%s section_chars=%s",
-                session_id[:8],
-                batch_index,
-                start + 1,
-                end,
-                len(section),
-            )
-
-            _pace_before_gemini(session_id)
-            usage_quota.reserve_batch()
-            updated_section = gemini_client.extract_libretto_markdown(
-                image_paths,
-                section,
-                on_wait=on_wait,
-            )
-            new_md = apply_section_update(current, updated_section)
-            write_libretto(session_id, new_md)
-
-            pages_done = end
-            job = _load_job(session_id) or job
-            job["status"] = "running"
-            job["pages_done"] = pages_done
-            job["current_batch"] = batch_index
-            job["error"] = None
-            job["wait"] = None
-            _save_job(job)
+                pages_done = end
+                job = _load_job(session_id) or job
+                job["status"] = "running"
+                job["pages_done"] = pages_done
+                job["current_batch"] = batch_index
+                job["error"] = None
+                job["wait"] = None
+                _save_job(job)
+            except GeminiDailyQuotaError as exc:
+                job = _load_job(session_id) or job
+                _pause_for_daily_quota(session_id, job, exc)
+                if not _await_daily_quota_reset(session_id):
+                    return
+                job = _load_job(session_id) or job
+                job["status"] = "running"
+                job["error"] = None
+                job["wait"] = None
+                _save_job(job)
+                continue
 
         job = _load_job(session_id) or job
         job["status"] = "done"
@@ -568,9 +743,6 @@ def run_extraction(session_id: str) -> None:
         job["wait"] = None
         _save_job(job)
         logger.info("Extract done session=%s", session_id[:8])
-    except GeminiDailyQuotaError as exc:
-        job = _load_job(session_id) or job
-        _pause_for_daily_quota(session_id, job, exc)
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
         logger.exception("Extract failed session=%s", session_id[:8])
         job = _load_job(session_id) or job

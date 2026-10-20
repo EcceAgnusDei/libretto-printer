@@ -1,12 +1,30 @@
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers.extract import router as extract_router
 from app.routers.ingest import router as ingest_router
+from app.services import extract as extract_service
 from app.services import usage_quota
 
-app = FastAPI(title="libretto-printer API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    extract_service.start_supervisor()
+    try:
+        yield
+    finally:
+        extract_service.stop_supervisor()
+
+
+app = FastAPI(
+    title="libretto-printer API",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
