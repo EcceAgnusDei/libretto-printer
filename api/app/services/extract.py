@@ -36,7 +36,7 @@ JobDict = dict[str, object]
 ACTIVE_STATUSES = frozenset({"running"})
 RESUMABLE_STATUSES = frozenset({"paused"})
 _VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
-_H2_RE = re.compile(r"(?m)^##[ \t]")
+_HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
 _last_gemini_call_at: float | None = None
@@ -141,8 +141,8 @@ def _total_batches(page_count: int, batch_size: int) -> int:
 
 
 def split_current_section(markdown: str) -> tuple[str, str]:
-    """Découpe prefix + section depuis le dernier titre ##."""
-    matches = list(_H2_RE.finditer(markdown))
+    """Découpe prefix + section depuis le dernier titre #, ## ou ###."""
+    matches = list(_HEADING_RE.finditer(markdown))
     if not matches:
         return "", markdown
     idx = matches[-1].start()
