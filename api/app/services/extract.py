@@ -235,7 +235,6 @@ def assert_preconditions(
 
     meta = ingest_service.get_session(session_id)
     _ = ingest_service.require_source_pdf(session_id)
-    _ = ingest_service.require_pages_rendered(session_id)
 
     if meta.pdf_page_count is None or meta.pdf_page_count < 1:
         raise HTTPException(
@@ -703,8 +702,17 @@ def _worker_entry(session_id: str) -> None:
             _running_sessions.discard(session_id)
 
 
+def _ensure_batch_rendered(session_id: str, end_page: int) -> None:
+    """Rend les pages PNG jusqu'à end_page (exclusif) si besoin."""
+    meta = ingest_service.get_session(session_id)
+    while meta.rendered_count < end_page:
+        if is_cancelled(session_id):
+            raise GeminiCancelledError("extraction annulée")
+        meta, _ = ingest_service.render_pdf_batch(session_id)
+
+
 def run_extraction(session_id: str) -> None:
-    """Passe unique : lots de N pages → Gemini → mise à jour libretto.md."""
+    """Passe unique : rendu d'un lot → Gemini → mise à jour libretto.md."""
     if is_cancelled(session_id):
         return
 
@@ -737,6 +745,7 @@ def run_extraction(session_id: str) -> None:
                 start = pages_done
                 end = min(start + batch_size, page_count)
                 batch_index = (start // batch_size) + 1
+                _ensure_batch_rendered(session_id, end)
                 page_indices = list(range(start, end))
                 image_paths = [_page_png_path(session_id, i) for i in page_indices]
                 missing = [str(p) for p in image_paths if not p.is_file()]

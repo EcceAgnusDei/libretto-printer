@@ -18,7 +18,6 @@ import {
   triggerExtraction,
   type ExtractStartResult,
   type ExtractStatusResult,
-  type IngestProgress,
 } from "../lib/extract";
 import { validatePdfLocally, type LocalPdfPreview } from "../lib/pdfLocal";
 import {
@@ -115,9 +114,6 @@ export default function Home() {
   );
   const [tracked, setTracked] = useState<ExtractStatusResult[]>([]);
   const [librettoMd, setLibrettoMd] = useState<string | null>(null);
-  const [ingestProgress, setIngestProgress] = useState<IngestProgress | null>(
-    null,
-  );
   const [quotaConfirm, setQuotaConfirm] = useState<QuotaCheck | null>(null);
   const [restoring, setRestoring] = useState(true);
   const userStartedDuringRestoreRef = useRef(false);
@@ -397,7 +393,6 @@ export default function Home() {
     setLiveStatus(null);
     setLibrettoMd(null);
     librettoSyncRef.current = null;
-    setIngestProgress(null);
     writeSessionIdToUrl(null);
     setPhase("validating");
 
@@ -425,12 +420,11 @@ export default function Home() {
     setLiveStatus(null);
     setLibrettoMd(null);
     librettoSyncRef.current = null;
-    setIngestProgress(null);
     setQuotaConfirm(null);
     setPhase("extracting");
 
     try {
-      const result = await triggerExtraction(loaded.file, setIngestProgress);
+      const result = await triggerExtraction(loaded.file);
       const asStatus = startToStatus(result);
       rememberFromStart(result);
       setTracked((prev) => [
@@ -455,7 +449,6 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "Échec du déclenchement");
     } finally {
       setPhase("idle");
-      setIngestProgress(null);
     }
   }
 
@@ -512,16 +505,6 @@ export default function Home() {
     void handleFiles(event.dataTransfer.files);
   }
 
-  function extractingLabel(): string {
-    if (!ingestProgress) return "Envoi et rendu…";
-    if (ingestProgress.phase === "upload") return "Upload du PDF…";
-    if (ingestProgress.phase === "render") {
-      const { renderedCount, pdfPageCount } = ingestProgress;
-      return `Rendu des pages… ${renderedCount}/${pdfPageCount}`;
-    }
-    return "Démarrage de l'extraction…";
-  }
-
   const visibleTracked = tracked.filter(
     (item) =>
       item.status === "running" ||
@@ -542,8 +525,8 @@ export default function Home() {
             libretto-printer
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Upload PDF, rendu des pages, puis extraction Gemini en une passe
-            (lots de 5, contexte section Markdown).
+            Upload PDF puis extraction Gemini en une passe (chaque lot est
+            rendu puis envoyé dès qu&apos;il est prêt).
           </p>
         </header>
 
@@ -632,7 +615,7 @@ export default function Home() {
             {phase === "validating"
               ? "Vérification du PDF…"
               : phase === "extracting"
-                ? extractingLabel()
+                ? "Envoi du PDF…"
                 : "Déposez un PDF, ou cliquez pour choisir"}
           </span>
           <span className="text-xs text-zinc-500">PDF uniquement</span>

@@ -324,32 +324,6 @@ async def attach_pdf(session_id: str, file: UploadFile) -> SessionMeta:
     return meta
 
 
-def require_pages_rendered(session_id: str) -> SessionMeta:
-    """Ensure PDF pages were rendered to PNG before downstream steps."""
-    meta = _load_meta(session_id)
-    if not meta.has_pdf or meta.pdf_page_count is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Aucun PDF attaché à cette session",
-        )
-    if not meta.done:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Pages non rendues: "
-                f"{meta.rendered_count}/{meta.pdf_page_count}. "
-                "Appelez POST /ingest/sessions/{id}/pdf/render jusqu'à done=true"
-            ),
-        )
-    pages = list(_pages_dir(session_id).glob("page_*.png"))
-    if len(pages) < meta.pdf_page_count:
-        raise HTTPException(
-            status_code=400,
-            detail="Pages PNG manquantes sur le disque; relancez le rendu",
-        )
-    return meta
-
-
 def render_pdf_batch(session_id: str, start_page: int | None = None) -> tuple[SessionMeta, list[dict]]:
     meta = _load_meta(session_id)
     if not meta.has_pdf or meta.pdf_page_count is None:

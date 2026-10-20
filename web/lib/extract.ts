@@ -115,12 +115,6 @@ function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
   };
 }
 
-export type IngestProgress = {
-  phase: "upload" | "render" | "start";
-  renderedCount: number;
-  pdfPageCount: number;
-};
-
 async function readError(res: Response): Promise<string> {
   try {
     const data = (await res.json()) as { detail?: unknown };
@@ -179,47 +173,6 @@ async function uploadPdf(sessionId: string, file: File): Promise<number> {
   return data.pdf_page_count;
 }
 
-/** Render PDF pages in batches until the server reports done=true. */
-async function renderAllPages(
-  sessionId: string,
-  onProgress?: (progress: IngestProgress) => void,
-): Promise<{ renderedCount: number; pdfPageCount: number }> {
-  let done = false;
-  let renderedCount = 0;
-  let pdfPageCount = 0;
-  let guard = 0;
-
-  while (!done) {
-    guard += 1;
-    if (guard > 1000) {
-      throw new Error("Rendu interrompu: trop de lots");
-    }
-
-    const res = await fetch(
-      `${apiBase()}/ingest/sessions/${sessionId}/pdf/render`,
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      throw new Error(await readError(res));
-    }
-    const data = (await res.json()) as {
-      rendered_count: number;
-      pdf_page_count: number;
-      done: boolean;
-    };
-    renderedCount = data.rendered_count;
-    pdfPageCount = data.pdf_page_count;
-    done = data.done;
-    onProgress?.({
-      phase: "render",
-      renderedCount,
-      pdfPageCount,
-    });
-  }
-
-  return { renderedCount, pdfPageCount };
-}
-
 async function startExtract(sessionId: string): Promise<ExtractStartResult> {
   const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/start`, {
     method: "POST",
@@ -241,26 +194,11 @@ export async function deleteSession(sessionId: string): Promise<void> {
   }
 }
 
-export async function triggerExtraction(
-  file: File,
-  onProgress?: (progress: IngestProgress) => void,
-): Promise<ExtractStartResult> {
+export async function triggerExtraction(file: File): Promise<ExtractStartResult> {
   await assertGeminiReady();
   const sessionId = await createSession(file.name);
   try {
-    onProgress?.({ phase: "upload", renderedCount: 0, pdfPageCount: 0 });
-    const pdfPageCount = await uploadPdf(sessionId, file);
-    onProgress?.({
-      phase: "render",
-      renderedCount: 0,
-      pdfPageCount,
-    });
-    const rendered = await renderAllPages(sessionId, onProgress);
-    onProgress?.({
-      phase: "start",
-      renderedCount: rendered.renderedCount,
-      pdfPageCount: rendered.pdfPageCount,
-    });
+    await uploadPdf(sessionId, file);
     return await startExtract(sessionId);
   } catch (err) {
     await deleteSession(sessionId);
