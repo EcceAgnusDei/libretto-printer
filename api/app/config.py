@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     devlog: bool = Field(
         default=False,
         validation_alias=AliasChoices("DEVLOG", "devlog"),
