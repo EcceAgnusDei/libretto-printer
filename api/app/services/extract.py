@@ -17,6 +17,7 @@ from app.services import gemini_client
 from app.services import ingest as ingest_service
 from app.services import usage_quota
 from app.services.gemini_errors import (
+    GeminiCancelledError,
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
     MSG_RATE_LIMIT,
@@ -39,6 +40,8 @@ _VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
 _HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
+_cancel_lock = threading.Lock()
+_cancelled_sessions: set[str] = set()
 _last_gemini_call_at: float | None = None
 _pace_lock = threading.Lock()
 _resume_lock = threading.Lock()
@@ -126,12 +129,37 @@ def _load_job(session_id: str) -> JobDict | None:
 
 
 def _save_job(job: JobDict) -> None:
+    session_id = str(job["session_id"])
     job["updated_at"] = _now_iso()
-    path = _job_path(str(job["session_id"]))
-    _ = path.write_text(
-        json.dumps(job, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    path = _job_path(session_id)
+    try:
+        _ = path.write_text(
+            json.dumps(job, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        if is_cancelled(session_id):
+            return
+        raise
+
+
+def is_cancelled(session_id: str) -> bool:
+    with _cancel_lock:
+        return session_id in _cancelled_sessions
+
+
+def _clear_cancel(session_id: str) -> None:
+    with _cancel_lock:
+        _cancelled_sessions.discard(session_id)
+
+
+def request_cancel(session_id: str) -> None:
+    """Stoppe les appels Gemini pour cette session (suppression / Retirer)."""
+    _ = ingest_service.assert_safe_session_id(session_id)
+    with _cancel_lock:
+        _cancelled_sessions.add(session_id)
+    with _resume_lock:
+        _resume_last_at.pop(session_id, None)
 
 
 def _total_batches(page_count: int, batch_size: int) -> int:
@@ -252,6 +280,7 @@ def start_job(session_id: str) -> JobDict:
         "created_at": now,
         "updated_at": now,
     }
+    _clear_cancel(session_id)
     _save_job(job)
     _spawn_worker(session_id)
     return job
@@ -372,6 +401,7 @@ def resume_job(
     job["status"] = "running"
     job["error"] = None
     job["wait"] = None
+    _clear_cancel(session_id)
     _save_job(job)
     _spawn_worker(session_id)
     return job
@@ -379,6 +409,8 @@ def resume_job(
 
 def try_auto_resume(session_id: str) -> bool:
     """Reprise silencieuse pour le superviseur. True si un worker a été lancé."""
+    if is_cancelled(session_id):
+        return False
     try:
         _ = resume_job(session_id, enforce_cooldown=False)
     except HTTPException as exc:
@@ -528,6 +560,9 @@ def _await_daily_quota_reset(session_id: str) -> bool:
     l'attente (status=running, wait vidé) fait aussi retourner True.
     """
     while True:
+        if is_cancelled(session_id):
+            return False
+
         job = _load_job(session_id)
         if job is None:
             return False
@@ -591,7 +626,7 @@ def _await_daily_quota_reset(session_id: str) -> bool:
         return True
 
 
-def _pace_before_gemini(_session_id: str) -> None:
+def _pace_before_gemini(session_id: str) -> None:
     """Respecte gemini_min_interval_seconds entre deux appels (pace silencieuse)."""
     global _last_gemini_call_at
     interval = settings.gemini_min_interval_seconds
@@ -605,7 +640,16 @@ def _pace_before_gemini(_session_id: str) -> None:
         if last is not None:
             delay = interval - (now - last)
         if delay > 0.05:
-            time.sleep(delay)
+            deadline = time.monotonic() + delay
+            while True:
+                if is_cancelled(session_id):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, 0.5))
+        if is_cancelled(session_id):
+            return
         _last_gemini_call_at = time.monotonic()
 
 
@@ -635,6 +679,8 @@ def get_libretto(session_id: str) -> str:
 
 
 def _spawn_worker(session_id: str) -> None:
+    if is_cancelled(session_id):
+        return
     with _worker_lock:
         if session_id in _running_sessions:
             return
@@ -659,6 +705,9 @@ def _worker_entry(session_id: str) -> None:
 
 def run_extraction(session_id: str) -> None:
     """Passe unique : lots de N pages → Gemini → mise à jour libretto.md."""
+    if is_cancelled(session_id):
+        return
+
     job = _load_job(session_id)
     if job is None:
         return
@@ -676,10 +725,14 @@ def run_extraction(session_id: str) -> None:
     _save_job(job)
 
     def on_wait(signal: QuotaSignal | None) -> None:
-        _set_job_wait(session_id, signal)
+        if not is_cancelled(session_id):
+            _set_job_wait(session_id, signal)
 
     try:
         while pages_done < page_count:
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return
             try:
                 start = pages_done
                 end = min(start + batch_size, page_count)
@@ -706,12 +759,22 @@ def run_extraction(session_id: str) -> None:
                 )
 
                 _pace_before_gemini(session_id)
+                if is_cancelled(session_id):
+                    logger.info("Extract cancelled session=%s", session_id[:8])
+                    return
                 usage_quota.reserve_batch()
+                if is_cancelled(session_id):
+                    logger.info("Extract cancelled session=%s", session_id[:8])
+                    return
                 updated_section = gemini_client.extract_libretto_markdown(
                     image_paths,
                     section,
                     on_wait=on_wait,
+                    should_abort=lambda: is_cancelled(session_id),
                 )
+                if is_cancelled(session_id):
+                    logger.info("Extract cancelled session=%s", session_id[:8])
+                    return
                 new_md = apply_section_update(current, updated_section)
                 write_libretto(session_id, new_md)
 
@@ -723,7 +786,12 @@ def run_extraction(session_id: str) -> None:
                 job["error"] = None
                 job["wait"] = None
                 _save_job(job)
+            except GeminiCancelledError:
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return
             except GeminiDailyQuotaError as exc:
+                if is_cancelled(session_id):
+                    return
                 job = _load_job(session_id) or job
                 _pause_for_daily_quota(session_id, job, exc)
                 if not _await_daily_quota_reset(session_id):
@@ -735,6 +803,8 @@ def run_extraction(session_id: str) -> None:
                 _save_job(job)
                 continue
 
+        if is_cancelled(session_id):
+            return
         job = _load_job(session_id) or job
         job["status"] = "done"
         job["pages_done"] = page_count
@@ -743,7 +813,11 @@ def run_extraction(session_id: str) -> None:
         job["wait"] = None
         _save_job(job)
         logger.info("Extract done session=%s", session_id[:8])
+    except GeminiCancelledError:
+        logger.info("Extract cancelled session=%s", session_id[:8])
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
+        if is_cancelled(session_id):
+            return
         logger.exception("Extract failed session=%s", session_id[:8])
         job = _load_job(session_id) or job
         job["status"] = "error"

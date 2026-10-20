@@ -11,6 +11,7 @@ import {
   type QuotaCheck,
 } from "../lib/apiConfig";
 import {
+  deleteSession,
   fetchExtractStatus,
   fetchLibretto,
   statusToStartResult,
@@ -386,6 +387,7 @@ export default function Home() {
       setQuotaConfirm(null);
       writeSessionIdToUrl(null);
     }
+    void deleteSession(sessionId);
   }
 
   async function handleFiles(fileList: FileList | null) {

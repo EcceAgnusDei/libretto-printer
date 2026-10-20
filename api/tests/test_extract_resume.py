@@ -22,6 +22,7 @@ from app.services import gemini_client, usage_quota  # noqa: E402
 from app.services import ingest as ingest_service  # noqa: E402
 from app.services.extract import JobDict  # noqa: E402
 from app.services.gemini_errors import (  # noqa: E402
+    GeminiCancelledError,
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
     MSG_RATE_LIMIT,
@@ -67,12 +68,14 @@ class ExtractResumeTests(unittest.TestCase):
         settings.gemini_max_batches_per_day = 100
         settings.extract_resume_cooldown_seconds = 0
         extract_service._running_sessions.clear()
+        extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
 
     @override
     def tearDown(self) -> None:
         extract_service._running_sessions.clear()
+        extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
         assert self._old_data is not None
@@ -910,6 +913,47 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(len(sleeps), 1)
         self.assertLessEqual(sleeps[0], extract_service._DAILY_WAIT_CHUNK_SECONDS)
+
+    def test_request_cancel_stops_worker_before_gemini(self) -> None:
+        session_id = self._make_session(page_count=4)
+        calls = {"n": 0}
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+        ) -> str:
+            calls["n"] += 1
+            return "# Cancelled\n"
+
+        with patch.object(extract_service, "_spawn_worker"):
+            job = extract_service.start_job(session_id)
+        self.assertEqual(job["status"], "running")
+        extract_service.request_cancel(session_id)
+        ingest_service.delete_session(session_id)
+
+        with patch.object(
+            gemini_client,
+            "extract_libretto_markdown",
+            side_effect=fake_extract,
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertEqual(calls["n"], 0)
+        self.assertTrue(extract_service.is_cancelled(session_id))
+        self.assertFalse((settings.sessions_dir / session_id).exists())
+        self.assertFalse(extract_service.try_auto_resume(session_id))
+
+    def test_gemini_rate_limit_wait_aborts_when_cancelled(self) -> None:
+        aborted = {"n": 0}
+
+        def should_abort() -> bool:
+            aborted["n"] += 1
+            return aborted["n"] >= 2
+
+        with self.assertRaises(GeminiCancelledError):
+            gemini_client._interruptible_sleep(30.0, should_abort)
+        self.assertGreaterEqual(aborted["n"], 2)
 
 
 class UsageQuotaSourceTests(unittest.TestCase):

@@ -230,8 +230,8 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
   return mapStartLike((await res.json()) as ExtractApiPayload);
 }
 
-/** Best-effort rollback if triggerExtraction fails mid-flight. */
-async function deleteSession(sessionId: string): Promise<void> {
+/** Annule l'extraction Gemini et supprime la session côté serveur. */
+export async function deleteSession(sessionId: string): Promise<void> {
   try {
     await fetch(`${apiBase()}/ingest/sessions/${sessionId}`, {
       method: "DELETE",

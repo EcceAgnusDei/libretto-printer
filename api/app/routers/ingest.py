@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from app.config import settings
@@ -11,6 +11,7 @@ from app.schemas.ingest import (
     PdfUploadResponse,
     SessionDetailResponse,
 )
+from app.services import extract as extract_service
 from app.services import ingest as ingest_service
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -40,7 +41,12 @@ async def get_session(session_id: str, offset: int = 0, limit: int = 5):
 
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session(session_id: str):
-    ingest_service.delete_session(session_id)
+    extract_service.request_cancel(session_id)
+    try:
+        ingest_service.delete_session(session_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
 
 
 @router.post("/sessions/{session_id}/pdf", response_model=PdfUploadResponse)

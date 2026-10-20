@@ -12,6 +12,7 @@ from google.genai import types
 from app.config import settings
 from app.devlog import devlog
 from app.services.gemini_errors import (
+    GeminiCancelledError,
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
     MSG_RATE_LIMIT,
@@ -66,6 +67,7 @@ _FENCE_RE = re.compile(r"^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$", re.IGNOR
 _client: genai.Client | None = None
 
 WaitCallback = Callable[[QuotaSignal | None], None]
+AbortCheck = Callable[[], bool]
 
 
 def _get_client() -> genai.Client:
@@ -97,11 +99,30 @@ def _strip_fences(text: str) -> str:
     return text
 
 
+def _raise_if_aborted(should_abort: AbortCheck | None) -> None:
+    if should_abort is not None and should_abort():
+        raise GeminiCancelledError("extraction annulée")
+
+
+def _interruptible_sleep(
+    seconds: float,
+    should_abort: AbortCheck | None,
+) -> None:
+    deadline = time.monotonic() + max(seconds, 0.0)
+    while True:
+        _raise_if_aborted(should_abort)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.5))
+
+
 def _handle_quota_and_maybe_wait(
     exc: BaseException,
     *,
     attempt: int,
     on_wait: WaitCallback | None,
+    should_abort: AbortCheck | None = None,
 ) -> bool:
     """
     True = caller should retry after wait already done.
@@ -146,7 +167,7 @@ def _handle_quota_and_maybe_wait(
         wait_seconds,
         type(exc).__name__,
     )
-    time.sleep(wait_seconds)
+    _interruptible_sleep(wait_seconds, should_abort)
     if on_wait is not None:
         on_wait(None)
     return True
@@ -157,10 +178,13 @@ def extract_libretto_markdown(
     section_context: str,
     *,
     on_wait: WaitCallback | None = None,
+    should_abort: AbortCheck | None = None,
 ) -> str:
     """Envoie images + contexte depuis le dernier titre ; retourne la section mise à jour."""
     if not image_paths:
         raise ValueError("Aucune image à envoyer")
+
+    _raise_if_aborted(should_abort)
 
     parts: list[types.Part] = [types.Part.from_text(text=EXTRACT_INSTRUCTION)]
 
@@ -188,6 +212,7 @@ def extract_libretto_markdown(
         )
     )
     for index, path in enumerate(image_paths, start=1):
+        _raise_if_aborted(should_abort)
         data = path.read_bytes()
         parts.append(types.Part.from_text(text=f"Image {index} :"))
         parts.append(types.Part.from_bytes(data=data, mime_type="image/png"))
@@ -205,6 +230,7 @@ def extract_libretto_markdown(
         ]
 
     for attempt in range(max_attempts):
+        _raise_if_aborted(should_abort)
         try:
             devlog(
                 "Gemini request model=%s attempt=%s/%s images=%s section_chars=%s",
@@ -222,6 +248,7 @@ def extract_libretto_markdown(
             text = _strip_fences(response.text or "")
             if not text:
                 raise ValueError("Réponse Gemini vide")
+            _raise_if_aborted(should_abort)
             devlog(
                 "Gemini response model=%s attempt=%s chars=%s",
                 settings.gemini_model,
@@ -231,6 +258,8 @@ def extract_libretto_markdown(
             if on_wait is not None:
                 on_wait(None)
             return text
+        except GeminiCancelledError:
+            raise
         except GeminiDailyQuotaError:
             if on_wait is not None:
                 on_wait(
@@ -245,9 +274,14 @@ def extract_libretto_markdown(
             last_error = exc
             try:
                 if _handle_quota_and_maybe_wait(
-                    exc, attempt=attempt, on_wait=on_wait
+                    exc,
+                    attempt=attempt,
+                    on_wait=on_wait,
+                    should_abort=should_abort,
                 ):
                     continue
+            except GeminiCancelledError:
+                raise
             except GeminiDailyQuotaError:
                 if on_wait is not None:
                     on_wait(
@@ -269,7 +303,7 @@ def extract_libretto_markdown(
                 type(exc).__name__,
                 str(exc)[:180],
             )
-            time.sleep(delay)
+            _interruptible_sleep(delay, should_abort)
 
     assert last_error is not None
     raise last_error

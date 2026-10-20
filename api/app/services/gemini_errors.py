@@ -31,6 +31,10 @@ class QuotaSignal:
     source: QuotaSource | None = None
 
 
+class GeminiCancelledError(Exception):
+    """Extraction annulée (session retirée) — interrompre retries / attentes."""
+
+
 class GeminiDailyQuotaError(Exception):
     """Quota journalier Gemini ou serveur — ne pas retry aujourd'hui."""
 
