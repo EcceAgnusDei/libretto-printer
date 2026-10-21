@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.access_log import configure_access_log_filters
 from app.config import settings
 from app.routers.extract import router as extract_router
 from app.routers.ingest import router as ingest_router
@@ -15,6 +16,7 @@ from app.services import extract as extract_service
 from app.services import usage_quota
 
 logger = logging.getLogger(__name__)
+configure_access_log_filters()
 
 
 class ForceHttpsMiddleware(BaseHTTPMiddleware):
