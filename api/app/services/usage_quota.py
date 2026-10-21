@@ -10,11 +10,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config import settings
-from app.services.gemini_errors import GeminiDailyQuotaError, MSG_DAILY_QUOTA
+from app.services.gemini_errors import (
+    GeminiDailyQuotaError,
+    MSG_DAILY_QUOTA,
+    MSG_QUOTA_MISCONFIGURED,
+)
 
 _lock = threading.Lock()
 logger = logging.getLogger(__name__)
 _warned_unlimited = False
+_warned_misconfigured = False
 
 # Compteur local = garde-fou coût machine unique (trusted), pas un contrôle d'accès multi-tenant.
 QUOTA_TIMEZONE = "UTC"
@@ -95,9 +100,34 @@ def batches_needed(page_count: int, batch_size: int | None = None) -> int:
     return math.ceil(page_count / size)
 
 
+def unlimited_allowed() -> bool:
+    return settings.gemini_max_batches_per_day <= 0 and (
+        settings.allow_unlimited_gemini_quota
+    )
+
+
+def assert_quota_configured() -> None:
+    """Refuse le mode illimité sauf si ALLOW_UNLIMITED_GEMINI_QUOTA=true."""
+    global _warned_misconfigured
+    if settings.gemini_max_batches_per_day > 0:
+        return
+    if settings.allow_unlimited_gemini_quota:
+        return
+    if not _warned_misconfigured:
+        _warned_misconfigured = True
+        logger.error(
+            "gemini_max_batches_per_day=%s sans ALLOW_UNLIMITED_GEMINI_QUOTA "
+            "— quota illimité interdit",
+            settings.gemini_max_batches_per_day,
+        )
+    raise GeminiDailyQuotaError(MSG_QUOTA_MISCONFIGURED, source="server")
+
+
 def _warn_if_unlimited(limit: int) -> None:
     global _warned_unlimited
     if limit > 0 or _warned_unlimited:
+        return
+    if not settings.allow_unlimited_gemini_quota:
         return
     _warned_unlimited = True
     logger.warning(
@@ -110,10 +140,13 @@ def get_usage() -> dict:
     with _lock:
         data = _load_unlocked()
     limit = settings.gemini_max_batches_per_day
-    _warn_if_unlimited(limit)
     used = int(data["batches"])
     if limit <= 0:
-        remaining = None
+        if settings.allow_unlimited_gemini_quota:
+            _warn_if_unlimited(limit)
+            remaining = None
+        else:
+            remaining = 0
     else:
         remaining = max(0, limit - used)
     return {
@@ -129,6 +162,7 @@ def get_usage() -> dict:
 
 def assert_under_daily_limit() -> None:
     """Lève GeminiDailyQuotaError si le plafond journalier de lots est atteint."""
+    assert_quota_configured()
     limit = settings.gemini_max_batches_per_day
     if limit <= 0:
         return
@@ -140,6 +174,7 @@ def assert_under_daily_limit() -> None:
 
 def reserve_batch() -> None:
     """Réserve un lot de façon atomique (vérifie + incrémente sous le même verrou)."""
+    assert_quota_configured()
     limit = settings.gemini_max_batches_per_day
     with _lock:
         data = _load_unlocked()
@@ -151,7 +186,8 @@ def reserve_batch() -> None:
 
 
 def record_batch() -> None:
-    """Incrémente sans plafond — réservé aux tests ; le worker doit utiliser reserve_batch()."""
+    """Incrémente après un appel Gemini réussi (pas de pré-réservation)."""
+    assert_quota_configured()
     with _lock:
         data = _load_unlocked()
         data["batches"] = int(data["batches"]) + 1

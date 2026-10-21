@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request
 
+from app.config import settings
 from app.schemas.extract import (
     ExtractStartResponse,
     ExtractStatusResponse,
@@ -9,8 +10,17 @@ from app.schemas.extract import (
     LibrettoResponse,
 )
 from app.services import extract as extract_service
+from app.services import rate_limit
 
 router = APIRouter(prefix="/extract", tags=["extract"])
+
+
+def _rate_limit_extract_start(request: Request) -> None:
+    rate_limit.enforce(
+        request,
+        "extract_start",
+        settings.rate_limit_extract_start_max,
+    )
 
 
 def _wait_from_job(job: dict) -> ExtractWaitInfo | None:
@@ -49,6 +59,7 @@ def _start_like_response(job: dict) -> ExtractStartResponse:
 @router.post(
     "/sessions/{session_id}/start",
     response_model=ExtractStartResponse,
+    dependencies=[Depends(_rate_limit_extract_start)],
 )
 def start_extract(session_id: str):
     return _start_like_response(extract_service.start_job(session_id))

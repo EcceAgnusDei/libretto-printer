@@ -48,6 +48,52 @@ class Settings(BaseSettings):
             "gemini_max_requests_per_day",
         ),
     )
+    allow_unlimited_gemini_quota: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ALLOW_UNLIMITED_GEMINI_QUOTA",
+            "allow_unlimited_gemini_quota",
+        ),
+    )
+    rate_limit_window_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices(
+            "RATE_LIMIT_WINDOW_SECONDS",
+            "rate_limit_window_seconds",
+        ),
+    )
+    rate_limit_upload_max: int = Field(
+        default=20,
+        validation_alias=AliasChoices(
+            "RATE_LIMIT_UPLOAD_MAX",
+            "rate_limit_upload_max",
+        ),
+    )
+    rate_limit_extract_start_max: int = Field(
+        default=30,
+        validation_alias=AliasChoices(
+            "RATE_LIMIT_EXTRACT_START_MAX",
+            "rate_limit_extract_start_max",
+        ),
+    )
+    trust_proxy_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRUST_PROXY_HEADERS",
+            "trust_proxy_headers",
+        ),
+    )
+    force_https: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("FORCE_HTTPS", "force_https"),
+    )
+    session_ttl_hours: float = Field(
+        default=72.0,
+        validation_alias=AliasChoices(
+            "SESSION_TTL_HOURS",
+            "session_ttl_hours",
+        ),
+    )
     max_upload_bytes: int = 50 * 1024 * 1024
     max_pages_per_session: int = 500
     render_dpi: int = 150

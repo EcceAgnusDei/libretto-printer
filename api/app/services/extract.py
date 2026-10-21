@@ -20,9 +20,12 @@ from app.services.gemini_errors import (
     GeminiCancelledError,
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_EXTRACT_FAILED,
+    MSG_QUOTA_MISCONFIGURED,
     MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     QuotaSignal,
+    client_safe_error,
     next_gemini_reset_at,
     next_gemini_reset_iso,
     parse_wait_until,
@@ -232,6 +235,14 @@ def assert_preconditions(
             status_code=503,
             detail="GEMINI_API_KEY non configurée",
         )
+
+    try:
+        usage_quota.assert_quota_configured()
+    except GeminiDailyQuotaError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=MSG_QUOTA_MISCONFIGURED,
+        ) from exc
 
     meta = ingest_service.get_session(session_id)
     _ = ingest_service.require_source_pdf(session_id)
@@ -443,10 +454,54 @@ def reconcile_orphaned_jobs() -> int:
     return resumed
 
 
+def _session_last_activity_ts(session_id: str) -> float:
+    base = settings.sessions_dir / session_id
+    try:
+        newest = base.stat().st_mtime
+    except OSError:
+        return 0.0
+    for name in ("meta.json", "extract_job.json", "libretto.md"):
+        path = base / name
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def purge_expired_sessions() -> int:
+    """Supprime les sessions inactives plus anciennes que session_ttl_hours."""
+    ttl_hours = settings.session_ttl_hours
+    if ttl_hours <= 0:
+        return 0
+    cutoff = time.time() - (ttl_hours * 3600.0)
+    deleted = 0
+    for session_id in _list_session_ids():
+        if _session_last_activity_ts(session_id) >= cutoff:
+            continue
+        request_cancel(session_id)
+        try:
+            ingest_service.delete_session(session_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                logger.warning(
+                    "Purge session=%s failed: %s",
+                    session_id[:8],
+                    exc.detail,
+                )
+            continue
+        deleted += 1
+        logger.info("Purged expired session=%s", session_id[:8])
+    return deleted
+
+
 def _supervisor_loop() -> None:
     interval = max(settings.extract_supervisor_interval_seconds, 1.0)
     while not _supervisor_stop.wait(interval):
         try:
+            purged = purge_expired_sessions()
+            if purged:
+                logger.info("Extract supervisor purged %s session(s)", purged)
             count = reconcile_orphaned_jobs()
             if count:
                 logger.info("Extract supervisor resumed %s session(s)", count)
@@ -663,6 +718,9 @@ def get_job(session_id: str) -> JobDict:
         )
     normalized = _normalize_job(job)
     normalized["stale"] = job_is_stale(normalized)
+    raw_error = normalized.get("error")
+    if isinstance(raw_error, str):
+        normalized["error"] = client_safe_error(raw_error)
     return normalized
 
 
@@ -771,7 +829,7 @@ def run_extraction(session_id: str) -> None:
                 if is_cancelled(session_id):
                     logger.info("Extract cancelled session=%s", session_id[:8])
                     return
-                usage_quota.reserve_batch()
+                usage_quota.assert_under_daily_limit()
                 if is_cancelled(session_id):
                     logger.info("Extract cancelled session=%s", session_id[:8])
                     return
@@ -784,6 +842,7 @@ def run_extraction(session_id: str) -> None:
                 if is_cancelled(session_id):
                     logger.info("Extract cancelled session=%s", session_id[:8])
                     return
+                usage_quota.record_batch()
                 new_md = apply_section_update(current, updated_section)
                 write_libretto(session_id, new_md)
 
@@ -802,6 +861,12 @@ def run_extraction(session_id: str) -> None:
                 if is_cancelled(session_id):
                     return
                 job = _load_job(session_id) or job
+                if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
+                    job["status"] = "error"
+                    job["error"] = MSG_QUOTA_MISCONFIGURED
+                    job["wait"] = None
+                    _save_job(job)
+                    return
                 _pause_for_daily_quota(session_id, job, exc)
                 if not _await_daily_quota_reset(session_id):
                     return
@@ -827,9 +892,14 @@ def run_extraction(session_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
         if is_cancelled(session_id):
             return
-        logger.exception("Extract failed session=%s", session_id[:8])
+        logger.exception(
+            "Extract failed session=%s: %s: %s",
+            session_id[:8],
+            type(exc).__name__,
+            exc,
+        )
         job = _load_job(session_id) or job
         job["status"] = "error"
-        job["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        job["error"] = MSG_EXTRACT_FAILED
         job["wait"] = None
         _save_job(job)

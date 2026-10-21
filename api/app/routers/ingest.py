@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from app.config import settings
@@ -13,11 +13,24 @@ from app.schemas.ingest import (
 )
 from app.services import extract as extract_service
 from app.services import ingest as ingest_service
+from app.services import rate_limit
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
-@router.post("/sessions", response_model=CreateSessionResponse)
+def _rate_limit_upload(request: Request) -> None:
+    rate_limit.enforce(
+        request,
+        "upload",
+        settings.rate_limit_upload_max,
+    )
+
+
+@router.post(
+    "/sessions",
+    response_model=CreateSessionResponse,
+    dependencies=[Depends(_rate_limit_upload)],
+)
 async def create_session(source_name: str = Form(default="")):
     meta = ingest_service.create_session(source_name=source_name)
     return CreateSessionResponse(session_id=meta.session_id)
@@ -49,7 +62,11 @@ async def delete_session(session_id: str):
             raise
 
 
-@router.post("/sessions/{session_id}/pdf", response_model=PdfUploadResponse)
+@router.post(
+    "/sessions/{session_id}/pdf",
+    response_model=PdfUploadResponse,
+    dependencies=[Depends(_rate_limit_upload)],
+)
 async def upload_pdf(
     session_id: str,
     file: UploadFile = File(...),

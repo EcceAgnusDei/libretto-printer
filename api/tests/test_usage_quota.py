@@ -133,6 +133,12 @@ class UsageQuotaBatchesTests(unittest.TestCase):
         leftovers = list(settings.data_dir.glob(".gemini_usage.*.tmp"))
         self.assertEqual(leftovers, [])
 
+    def test_record_batch_increments_after_success_path(self) -> None:
+        usage_quota.assert_under_daily_limit()
+        usage_quota.record_batch()
+        usage = usage_quota.get_usage()
+        self.assertEqual(usage["batches_used"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

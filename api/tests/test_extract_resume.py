@@ -264,7 +264,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "## Acte I\n\nLot 1.\n"
@@ -276,7 +276,8 @@ class ExtractResumeTests(unittest.TestCase):
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
             patch.object(
                 extract_service,
                 "_await_daily_quota_reset",
@@ -357,7 +358,7 @@ class ExtractResumeTests(unittest.TestCase):
         self._write_partial_job(session_id, pages_done=2, source="gemini")
         seen_starts: list[int] = []
 
-        def fake_extract(image_paths, section, *, on_wait=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
             start = int(image_paths[0].stem.split("_")[1])
             seen_starts.append(start)
             return f"{section}\nPage {start}.\n"
@@ -369,7 +370,8 @@ class ExtractResumeTests(unittest.TestCase):
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
         ):
             extract_service.resume_job(session_id)
             extract_service.run_extraction(session_id)
@@ -638,7 +640,7 @@ class ExtractResumeTests(unittest.TestCase):
         )
         reset = next_gemini_reset_iso()
 
-        def fake_extract(image_paths, section, *, on_wait=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
             raise GeminiDailyQuotaError(
                 MSG_DAILY_QUOTA,
                 source="gemini",
@@ -652,7 +654,8 @@ class ExtractResumeTests(unittest.TestCase):
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
             patch.object(
                 extract_service,
                 "_await_daily_quota_reset",
@@ -694,7 +697,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "## Acte I\n\nLot 1.\n"
@@ -708,7 +711,8 @@ class ExtractResumeTests(unittest.TestCase):
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
             patch.object(
                 extract_service,
                 "_await_daily_quota_reset",
@@ -752,7 +756,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise GeminiDailyQuotaError(
@@ -769,7 +773,8 @@ class ExtractResumeTests(unittest.TestCase):
                 "extract_libretto_markdown",
                 side_effect=fake_extract,
             ),
-            patch.object(usage_quota, "reserve_batch"),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
             patch.object(
                 extract_service,
                 "_await_daily_quota_reset",
@@ -922,6 +927,7 @@ class ExtractResumeTests(unittest.TestCase):
             _paths: object,
             _section: str,
             on_wait: object = None,
+            should_abort: object = None,
         ) -> str:
             calls["n"] += 1
             return "# Cancelled\n"

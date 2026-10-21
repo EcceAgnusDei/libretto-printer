@@ -11,6 +11,28 @@ from app.config import settings
 MSG_RATE_LIMIT = "forte affluence : extraction ralentie"
 MSG_DAILY_QUOTA = "dépassement des quota d'utilisation, réessayez demain"
 MSG_RESUME_COOLDOWN = "reprise trop fréquente, réessayez dans quelques secondes"
+MSG_EXTRACT_FAILED = "échec de l'extraction, réessayez plus tard"
+MSG_QUOTA_MISCONFIGURED = "quota journalier non configuré"
+
+SAFE_CLIENT_ERROR_MESSAGES = frozenset(
+    {
+        MSG_RATE_LIMIT,
+        MSG_DAILY_QUOTA,
+        MSG_RESUME_COOLDOWN,
+        MSG_EXTRACT_FAILED,
+        MSG_QUOTA_MISCONFIGURED,
+        "trop de requêtes, réessayez plus tard",
+        "GEMINI_API_KEY non configurée",
+    }
+)
+
+
+def client_safe_error(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    if raw in SAFE_CLIENT_ERROR_MESSAGES:
+        return raw
+    return MSG_EXTRACT_FAILED
 
 QuotaKind = Literal["rate_limit", "daily"]
 QuotaSource = Literal["server", "gemini"]
