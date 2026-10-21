@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
@@ -53,6 +56,8 @@ _DAILY_WAIT_CHUNK_SECONDS = 30.0
 _supervisor_stop = threading.Event()
 _supervisor_thread: threading.Thread | None = None
 _supervisor_lock = threading.Lock()
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -132,14 +137,31 @@ def _load_job(session_id: str) -> JobDict | None:
 
 
 def _save_job(job: JobDict) -> None:
+    """Écriture atomique (tmp + replace) pour éviter un JSON corrompu mid-write."""
     session_id = str(job["session_id"])
     job["updated_at"] = _now_iso()
     path = _job_path(session_id)
+    payload = json.dumps(job, ensure_ascii=False, indent=2)
+    directory = path.parent
     try:
-        _ = path.write_text(
-            json.dumps(job, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory),
+            prefix=".extract_job.",
+            suffix=".tmp",
         )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except OSError:
         if is_cancelled(session_id):
             return
@@ -266,7 +288,17 @@ def assert_preconditions(
 
 
 def start_job(session_id: str) -> JobDict:
-    """Ouvre le job et lance la passe unique en arrière-plan."""
+    """Ouvre le job et lance la passe unique en arrière-plan.
+
+    Un job en pause quota (ou legacy error+daily) est repris via resume_job
+    pour ne pas écraser libretto.md / pages_done.
+    """
+    existing = _load_job(session_id)
+    if existing is not None:
+        normalized = _normalize_job(existing)
+        if _is_daily_resumable(normalized):
+            return resume_job(session_id)
+
     meta = assert_preconditions(session_id)
     assert meta.pdf_page_count is not None
 
@@ -509,8 +541,33 @@ def _supervisor_loop() -> None:
             logger.exception("Extract supervisor tick failed")
 
 
+def start_worker_pool() -> None:
+    """Pool borné pour les extractions (évite un thread par session)."""
+    global _executor
+    with _executor_lock:
+        if _executor is not None:
+            return
+        workers = max(1, int(settings.extract_max_concurrent_workers))
+        _executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="extract-worker",
+        )
+        logger.info("Extract worker pool started (max_workers=%s)", workers)
+
+
+def stop_worker_pool() -> None:
+    global _executor
+    with _executor_lock:
+        pool = _executor
+        _executor = None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+        logger.info("Extract worker pool stopped")
+
+
 def start_supervisor() -> None:
     global _supervisor_thread
+    start_worker_pool()
     with _supervisor_lock:
         if _supervisor_thread is not None and _supervisor_thread.is_alive():
             return
@@ -535,6 +592,7 @@ def stop_supervisor() -> None:
         _supervisor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2.0)
+    stop_worker_pool()
 
 
 def _set_job_wait(session_id: str, signal: QuotaSignal | None) -> None:
@@ -738,18 +796,19 @@ def get_libretto(session_id: str) -> str:
 def _spawn_worker(session_id: str) -> None:
     if is_cancelled(session_id):
         return
+    start_worker_pool()
     with _worker_lock:
         if session_id in _running_sessions:
             return
         _running_sessions.add(session_id)
 
-    thread = threading.Thread(
-        target=_worker_entry,
-        args=(session_id,),
-        name=f"extract-{session_id[:8]}",
-        daemon=True,
-    )
-    thread.start()
+    with _executor_lock:
+        pool = _executor
+    if pool is None:
+        with _worker_lock:
+            _running_sessions.discard(session_id)
+        return
+    _ = pool.submit(_worker_entry, session_id)
 
 
 def _worker_entry(session_id: str) -> None:

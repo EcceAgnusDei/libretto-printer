@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import override
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from PIL import Image
@@ -50,6 +52,7 @@ class ExtractResumeTests(unittest.TestCase):
     _old_interval: float | None = None
     _old_limit: int | None = None
     _old_cooldown: float | None = None
+    _old_workers: int | None = None
 
     @override
     def setUp(self) -> None:
@@ -60,6 +63,7 @@ class ExtractResumeTests(unittest.TestCase):
         self._old_interval = settings.gemini_min_interval_seconds
         self._old_limit = settings.gemini_max_batches_per_day
         self._old_cooldown = settings.extract_resume_cooldown_seconds
+        self._old_workers = settings.extract_max_concurrent_workers
         settings.data_dir = Path(self._tmp.name)
         settings.sessions_dir.mkdir(parents=True, exist_ok=True)
         settings.gemini_api_key = "test-key"
@@ -67,6 +71,8 @@ class ExtractResumeTests(unittest.TestCase):
         settings.gemini_min_interval_seconds = 0
         settings.gemini_max_batches_per_day = 100
         settings.extract_resume_cooldown_seconds = 0
+        settings.extract_max_concurrent_workers = 2
+        extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
@@ -74,6 +80,7 @@ class ExtractResumeTests(unittest.TestCase):
 
     @override
     def tearDown(self) -> None:
+        extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
@@ -84,6 +91,7 @@ class ExtractResumeTests(unittest.TestCase):
         assert self._old_interval is not None
         assert self._old_limit is not None
         assert self._old_cooldown is not None
+        assert self._old_workers is not None
         assert self._tmp is not None
         settings.data_dir = self._old_data
         settings.gemini_api_key = self._old_key
@@ -91,6 +99,7 @@ class ExtractResumeTests(unittest.TestCase):
         settings.gemini_min_interval_seconds = self._old_interval
         settings.gemini_max_batches_per_day = self._old_limit
         settings.extract_resume_cooldown_seconds = self._old_cooldown
+        settings.extract_max_concurrent_workers = self._old_workers
         self._tmp.cleanup()
 
     def _make_session(self, page_count: int = 4) -> str:
@@ -167,15 +176,141 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertIsNone(job["wait"])
         self.assertEqual(extract_service.read_libretto(session_id), before_md)
 
-    def test_start_still_wipes_progress(self) -> None:
+    def test_start_on_paused_routes_to_resume(self) -> None:
         session_id = self._make_session(4)
-        self._write_partial_job(session_id, pages_done=2)
+        self._write_partial_job(session_id, pages_done=2, source="server")
+        before_md = extract_service.read_libretto(session_id)
 
-        with patch.object(extract_service, "_spawn_worker"):
+        with patch.object(extract_service, "_spawn_worker") as spawn:
             job = extract_service.start_job(session_id)
 
-        self.assertEqual(job["pages_done"], 0)
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["pages_done"], 2)
+        self.assertEqual(extract_service.read_libretto(session_id), before_md)
+
+    def test_start_on_done_still_wipes_progress(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=4, status="done")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["wait"] = None
+        job["error"] = None
+        extract_service._save_job(job)
+
+        with patch.object(extract_service, "_spawn_worker"):
+            started = extract_service.start_job(session_id)
+
+        self.assertEqual(started["pages_done"], 0)
         self.assertEqual(extract_service.read_libretto(session_id), "")
+
+    def test_save_job_atomic_roundtrip(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, source="server")
+        loaded = extract_service._load_job(session_id)
+        assert loaded is not None
+        loaded["pages_done"] = 3
+        extract_service._save_job(loaded)
+        again = extract_service._load_job(session_id)
+        assert again is not None
+        self.assertEqual(again["pages_done"], 3)
+        leftovers = list(
+            (settings.sessions_dir / session_id).glob(".extract_job.*.tmp")
+        )
+        self.assertEqual(leftovers, [])
+
+    def test_spawn_uses_bounded_worker_pool(self) -> None:
+        settings.extract_max_concurrent_workers = 3
+        extract_service.stop_worker_pool()
+        session_id = self._make_session(2)
+        fake_pool = MagicMock()
+        with patch(
+            "app.services.extract.ThreadPoolExecutor",
+            return_value=fake_pool,
+        ) as pool_cls:
+            extract_service._spawn_worker(session_id)
+            pool_cls.assert_called_once()
+            self.assertEqual(pool_cls.call_args.kwargs["max_workers"], 3)
+            fake_pool.submit.assert_called_once()
+            args = fake_pool.submit.call_args.args
+            self.assertEqual(args[0], extract_service._worker_entry)
+            self.assertEqual(args[1], session_id)
+        self.assertIn(session_id, extract_service._running_sessions)
+        extract_service._running_sessions.discard(session_id)
+        extract_service.stop_worker_pool()
+
+    def test_worker_pool_limits_concurrency(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        extract_service.stop_worker_pool()
+        extract_service.start_worker_pool()
+
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        for session_id in (session_a, session_b):
+            extract_service.write_libretto(session_id, "")
+            extract_service._save_job(
+                {
+                    "session_id": session_id,
+                    "status": "running",
+                    "source_name": "fixture.pdf",
+                    "pdf_page_count": 2,
+                    "batch_size": 2,
+                    "total_batches": 1,
+                    "pages_done": 0,
+                    "current_batch": 0,
+                    "error": None,
+                    "wait": None,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+        active = 0
+        max_seen = 0
+        lock = threading.Lock()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            nonlocal active, max_seen
+            with lock:
+                active += 1
+                max_seen = max(max_seen, active)
+                if active == 1:
+                    entered.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            with lock:
+                active -= 1
+            return "# Pool\n\nTexte.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service._spawn_worker(session_a)
+            extract_service._spawn_worker(session_b)
+            self.assertTrue(entered.wait(timeout=3.0))
+            time.sleep(0.2)
+            self.assertEqual(max_seen, 1)
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not extract_service._running_sessions:
+                    break
+                time.sleep(0.05)
+
+        self.assertEqual(max_seen, 1)
+        self.assertEqual(extract_service._running_sessions, set())
 
     def test_resume_rejects_non_daily_error(self) -> None:
         session_id = self._make_session(4)
