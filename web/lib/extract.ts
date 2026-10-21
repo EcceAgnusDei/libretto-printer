@@ -4,6 +4,8 @@ function apiBase(): string {
 
 export type ExtractJobStatus = "running" | "paused" | "done" | "error";
 
+export type ExtractPhase = "extract" | "review";
+
 export type ExtractWaitReason = "rate_limit" | "daily" | "queue";
 
 export type ExtractWaitSource = "server" | "gemini";
@@ -19,6 +21,7 @@ export type ExtractWaitInfo = {
 export type ExtractStartResult = {
   sessionId: string;
   status: ExtractJobStatus;
+  phase: ExtractPhase;
   sourceName: string;
   pdfPageCount: number;
   renderedCount: number;
@@ -26,18 +29,21 @@ export type ExtractStartResult = {
   totalBatches: number;
   pagesDone: number;
   currentBatch: number;
+  reviewDone: boolean;
   wait: ExtractWaitInfo | null;
 };
 
 export type ExtractStatusResult = {
   sessionId: string;
   status: ExtractJobStatus;
+  phase: ExtractPhase;
   sourceName: string;
   pdfPageCount: number | null;
   batchSize: number | null;
   totalBatches: number | null;
   pagesDone: number | null;
   currentBatch: number | null;
+  reviewDone: boolean;
   error: string | null;
   wait: ExtractWaitInfo | null;
   stale: boolean;
@@ -49,6 +55,7 @@ export function statusToStartResult(
   return {
     sessionId: status.sessionId,
     status: status.status,
+    phase: status.phase,
     sourceName: status.sourceName,
     pdfPageCount: status.pdfPageCount ?? 0,
     renderedCount: status.pdfPageCount ?? 0,
@@ -56,6 +63,7 @@ export function statusToStartResult(
     totalBatches: status.totalBatches ?? 0,
     pagesDone: status.pagesDone ?? 0,
     currentBatch: status.currentBatch ?? 0,
+    reviewDone: status.reviewDone,
     wait: status.wait,
   };
 }
@@ -85,12 +93,14 @@ function mapWait(
 type ExtractApiPayload = {
   session_id: string;
   status: ExtractJobStatus;
+  phase?: ExtractPhase;
   source_name: string;
   pdf_page_count: number;
   batch_size: number;
   total_batches: number;
   pages_done: number;
   current_batch: number;
+  review_done?: boolean;
   wait?: {
     reason: ExtractWaitReason;
     message: string;
@@ -100,10 +110,15 @@ type ExtractApiPayload = {
   } | null;
 };
 
+function mapPhase(phase: ExtractPhase | undefined): ExtractPhase {
+  return phase === "review" ? "review" : "extract";
+}
+
 function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
   return {
     sessionId: data.session_id,
     status: data.status,
+    phase: mapPhase(data.phase),
     sourceName: data.source_name,
     pdfPageCount: data.pdf_page_count,
     renderedCount: data.pdf_page_count,
@@ -111,6 +126,7 @@ function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
     totalBatches: data.total_batches,
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
+    reviewDone: Boolean(data.review_done),
     wait: mapWait(data.wait),
   };
 }
@@ -229,12 +245,14 @@ export async function fetchExtractStatus(
   const data = (await res.json()) as {
     session_id: string;
     status: ExtractJobStatus;
+    phase?: ExtractPhase;
     source_name: string;
     pdf_page_count: number | null;
     batch_size: number | null;
     total_batches: number | null;
     pages_done: number | null;
     current_batch: number | null;
+    review_done?: boolean;
     error: string | null;
     stale?: boolean;
     wait?: {
@@ -248,12 +266,14 @@ export async function fetchExtractStatus(
   return {
     sessionId: data.session_id,
     status: data.status,
+    phase: mapPhase(data.phase),
     sourceName: data.source_name,
     pdfPageCount: data.pdf_page_count,
     batchSize: data.batch_size,
     totalBatches: data.total_batches,
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
+    reviewDone: Boolean(data.review_done),
     error: data.error,
     wait: mapWait(data.wait),
     stale: Boolean(data.stale),

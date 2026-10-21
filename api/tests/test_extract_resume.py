@@ -82,9 +82,18 @@ class ExtractResumeTests(unittest.TestCase):
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
+        self._review_patcher = patch.object(
+            gemini_client,
+            "review_libretto_markdown",
+            side_effect=lambda markdown, **_kwargs: markdown,
+        )
+        self._review_patcher.start()
 
     @override
     def tearDown(self) -> None:
+        patcher = getattr(self, "_review_patcher", None)
+        if patcher is not None:
+            patcher.stop()
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
         extract_service._queue_order.clear()
@@ -759,7 +768,13 @@ class ExtractResumeTests(unittest.TestCase):
 
     def test_resume_rejects_when_complete(self) -> None:
         session_id = self._make_session(4)
-        self._write_partial_job(session_id, pages_done=4)
+        self._write_partial_job(session_id, pages_done=4, status="done")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["wait"] = None
+        job["error"] = None
+        job["review_done"] = True
+        extract_service._save_job(job)
 
         with self.assertRaises(HTTPException) as ctx:
             extract_service.resume_job(session_id)
@@ -980,6 +995,17 @@ class ExtractResumeTests(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(
+            extract_service._is_failed_resumable(
+                {
+                    "status": "error",
+                    "wait": None,
+                    "pages_done": 4,
+                    "pdf_page_count": 4,
+                    "review_done": False,
+                }
+            )
+        )
         self.assertFalse(
             extract_service._is_failed_resumable(
                 {
@@ -987,6 +1013,7 @@ class ExtractResumeTests(unittest.TestCase):
                     "wait": None,
                     "pages_done": 4,
                     "pdf_page_count": 4,
+                    "review_done": True,
                 }
             )
         )
@@ -1577,6 +1604,129 @@ class ExtractResumeTests(unittest.TestCase):
         with self.assertRaises(GeminiCancelledError):
             gemini_client._interruptible_sleep(30.0, should_abort)
         self.assertGreaterEqual(aborted["n"], 2)
+
+    def test_final_review_runs_after_extract(self) -> None:
+        session_id = self._make_session(2)
+        now = datetime.now(timezone.utc).isoformat()
+        extract_service.write_libretto(session_id, "")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "phase": "extract",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 2,
+                "batch_size": 2,
+                "total_batches": 1,
+                "pages_done": 0,
+                "current_batch": 0,
+                "review_done": False,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        review_calls: list[str] = []
+
+        def fake_review(
+            markdown: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            review_calls.append(markdown)
+            return "# Revu\n\n**A.** hello\n"
+
+        self._review_patcher.stop()
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                return_value="# Brut\n\n---A---\n",
+            ),
+            patch.object(
+                gemini_client,
+                "review_libretto_markdown",
+                side_effect=fake_review,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch") as record,
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertEqual(len(review_calls), 1)
+        self.assertEqual(record.call_count, 2)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["phase"], "review")
+        self.assertTrue(job["review_done"])
+        self.assertEqual(
+            extract_service.read_libretto(session_id).strip(),
+            "# Revu\n\n**A.** hello",
+        )
+        self._review_patcher = patch.object(
+            gemini_client,
+            "review_libretto_markdown",
+            side_effect=lambda markdown, **_kwargs: markdown,
+        )
+        self._review_patcher.start()
+
+    def test_resume_review_after_error(self) -> None:
+        session_id = self._make_session(2)
+        now = datetime.now(timezone.utc).isoformat()
+        extract_service.write_libretto(session_id, "# Partiel\n\nTexte.\n")
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "error",
+                "phase": "review",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 2,
+                "batch_size": 2,
+                "total_batches": 1,
+                "pages_done": 2,
+                "current_batch": 1,
+                "review_done": False,
+                "error": MSG_EXTRACT_FAILED,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+        with patch.object(extract_service, "_spawn_worker") as spawn:
+            job = extract_service.resume_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["pages_done"], 2)
+        self.assertFalse(job.get("review_done"))
+
+    def test_strip_staff_markers(self) -> None:
+        raw = "# Titre\n\n**A.** hi\n---A---\n---(aucun)---\n\n**B.** yo\n"
+        cleaned = extract_service.strip_staff_markers(raw)
+        self.assertNotIn("---", cleaned)
+        self.assertIn("**A.** hi", cleaned)
+        self.assertIn("**B.** yo", cleaned)
+
+    def test_legacy_done_job_is_not_review_pending(self) -> None:
+        session_id = self._make_session(2)
+        self._write_partial_job(session_id, pages_done=2, status="done")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["wait"] = None
+        job["error"] = None
+        if "review_done" in job:
+            del job["review_done"]
+        extract_service._save_job(job)
+        loaded = extract_service._normalize_job(
+            extract_service._load_job(session_id) or job
+        )
+        self.assertFalse(extract_service._review_pending(loaded))
+        with self.assertRaises(HTTPException) as ctx:
+            extract_service.resume_job(session_id)
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class UsageQuotaSourceTests(unittest.TestCase):

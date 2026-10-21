@@ -197,16 +197,21 @@ class ExtractErrorRedactionTests(unittest.TestCase):
                 "app.services.extract.gemini_client.extract_libretto_markdown",
                 return_value="# Titre\n\nTexte.\n",
             ),
+            patch(
+                "app.services.extract.gemini_client.review_libretto_markdown",
+                return_value="# Titre\n\nTexte.\n",
+            ),
             patch.object(usage_quota, "assert_under_daily_limit") as assert_limit,
             patch.object(usage_quota, "record_batch") as record,
         ):
             extract_service.run_extraction(session_id)
 
         assert_limit.assert_called()
-        record.assert_called_once()
+        self.assertEqual(record.call_count, 2)
         job = extract_service._load_job(session_id)
         assert job is not None
         self.assertEqual(job["status"], "done")
+        self.assertTrue(job.get("review_done"))
 
     def test_failed_extract_does_not_record_batch(self) -> None:
         session_id = self._make_session()

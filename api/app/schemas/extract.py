@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 ExtractStatus = Literal["running", "paused", "done", "error"]
+ExtractPhase = Literal["extract", "review"]
 WaitReason = Literal["rate_limit", "daily", "queue"]
 WaitSource = Literal["server", "gemini"]
 
@@ -20,24 +21,28 @@ class ExtractWaitInfo(BaseModel):
 class ExtractStartResponse(BaseModel):
     session_id: str
     status: ExtractStatus
+    phase: ExtractPhase = "extract"
     source_name: str
     pdf_page_count: int
     batch_size: int
     total_batches: int
     pages_done: int
     current_batch: int
+    review_done: bool = False
     wait: ExtractWaitInfo | None = None
 
 
 class ExtractStatusResponse(BaseModel):
     session_id: str
     status: ExtractStatus
+    phase: ExtractPhase = "extract"
     source_name: str
     pdf_page_count: int | None
     batch_size: int | None = None
     total_batches: int | None = None
     pages_done: int | None = None
     current_batch: int | None = None
+    review_done: bool = False
     error: str | None = None
     wait: ExtractWaitInfo | None = None
     stale: bool = False
@@ -48,4 +53,5 @@ class ExtractStatusResponse(BaseModel):
 class LibrettoResponse(BaseModel):
     session_id: str
     status: ExtractStatus
+    phase: ExtractPhase = "extract"
     markdown: str

@@ -94,10 +94,11 @@ def _save_unlocked(data: dict) -> None:
 
 
 def batches_needed(page_count: int, batch_size: int | None = None) -> int:
+    """Lots d'extraction + 1 pour la relecture finale Gemini."""
     size = batch_size if batch_size is not None else settings.batch_size
     if page_count <= 0 or size <= 0:
         return 0
-    return math.ceil(page_count / size)
+    return math.ceil(page_count / size) + 1
 
 
 def unlimited_allowed() -> bool:

@@ -57,12 +57,14 @@ function startToStatus(result: ExtractStartResult): ExtractStatusResult {
   return {
     sessionId: result.sessionId,
     status: result.status,
+    phase: result.phase,
     sourceName: result.sourceName,
     pdfPageCount: result.pdfPageCount,
     batchSize: result.batchSize,
     totalBatches: result.totalBatches,
     pagesDone: result.pagesDone,
     currentBatch: result.currentBatch,
+    reviewDone: result.reviewDone,
     error: null,
     wait: result.wait,
     stale: false,
@@ -80,18 +82,29 @@ function isDailyWaitStatus(status: ExtractStatusResult): boolean {
 function statusHeadline(status: ExtractStatusResult): string {
   if (status.status === "done") return "Extraction terminée";
   if (isDailyWaitStatus(status)) {
-    return "Quota journalier atteint — l'extraction reprendra demain";
+    return status.phase === "review"
+      ? "Quota journalier atteint — la relecture reprendra demain"
+      : "Quota journalier atteint — l'extraction reprendra demain";
   }
   if (status.stale) {
-    return "Extraction interrompue — reprise automatique";
+    return status.phase === "review"
+      ? "Relecture interrompue — reprise automatique"
+      : "Extraction interrompue — reprise automatique";
   }
   if (status.wait?.reason === "queue") {
     return status.wait.message || "mise en file d'attente";
   }
   if (status.wait?.reason === "rate_limit") {
-    return "Extraction ralentie — forte affluence";
+    return status.phase === "review"
+      ? "Relecture ralentie — forte affluence"
+      : "Extraction ralentie — forte affluence";
   }
-  if (status.status === "error") return "Extraction en erreur";
+  if (status.status === "error") {
+    return status.phase === "review"
+      ? "Relecture en erreur"
+      : "Extraction en erreur";
+  }
+  if (status.phase === "review") return "Relecture finale en cours";
   return "Extraction en cours";
 }
 
@@ -127,6 +140,8 @@ export default function Home() {
   const librettoSyncRef = useRef<{
     sessionId: string;
     pagesDone: number;
+    phase: string;
+    reviewDone: boolean;
   } | null>(null);
 
   const busy = phase !== "idle" || restoring;
@@ -136,7 +151,12 @@ export default function Home() {
   async function syncLibretto(
     sessionId: string,
     pagesDone: number | null,
-    options?: { silent?: boolean; cancelled?: () => boolean },
+    options?: {
+      silent?: boolean;
+      cancelled?: () => boolean;
+      phase?: string;
+      reviewDone?: boolean;
+    },
   ): Promise<void> {
     try {
       const lib = await fetchLibretto(sessionId);
@@ -145,6 +165,8 @@ export default function Home() {
       librettoSyncRef.current = {
         sessionId,
         pagesDone: pagesDone ?? 0,
+        phase: options?.phase ?? "extract",
+        reviewDone: options?.reviewDone ?? false,
       };
     } catch (err) {
       if (options?.silent) return;
@@ -249,6 +271,8 @@ export default function Home() {
             cancelled: () =>
               cancelled ||
               !shouldApplyRestoredFocus(userStartedDuringRestoreRef.current),
+            phase: preferred.phase,
+            reviewDone: preferred.reviewDone,
           });
         }
       } else {
@@ -338,10 +362,17 @@ export default function Home() {
 
       const pagesDone = selected.pagesDone ?? 0;
       const sync = librettoSyncRef.current;
-      if (sync?.sessionId !== selectedId || sync.pagesDone !== pagesDone) {
+      if (
+        sync?.sessionId !== selectedId ||
+        sync.pagesDone !== pagesDone ||
+        sync.phase !== selected.phase ||
+        sync.reviewDone !== selected.reviewDone
+      ) {
         await syncLibretto(selectedId, pagesDone, {
           silent: true,
           cancelled: () => cancelled,
+          phase: selected.phase,
+          reviewDone: selected.reviewDone,
         });
       }
       if (selected.status === "error") {
@@ -375,7 +406,10 @@ export default function Home() {
     applyJobSelection(status);
     setLibrettoMd(null);
     librettoSyncRef.current = null;
-    await syncLibretto(status.sessionId, status.pagesDone);
+    await syncLibretto(status.sessionId, status.pagesDone, {
+      phase: status.phase,
+      reviewDone: status.reviewDone,
+    });
   }
 
   function dismissTracked(sessionId: string): void {
@@ -408,7 +442,11 @@ export default function Home() {
       setJob(result);
       setLiveStatus(asStatus);
       writeSessionIdToUrl(result.sessionId);
-      await syncLibretto(result.sessionId, result.pagesDone, { silent: true });
+      await syncLibretto(result.sessionId, result.pagesDone, {
+        silent: true,
+        phase: result.phase,
+        reviewDone: result.reviewDone,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Échec de la reprise");
     } finally {
@@ -549,14 +587,14 @@ export default function Home() {
       <main className="w-full max-w-3xl space-y-8">
         <header className="space-y-2">
           <p className="text-sm tracking-wide text-zinc-500 uppercase">
-            Extraction libretto — passe unique
+            Extraction libretto — lots puis relecture
           </p>
           <h1 className="text-3xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
             libretto-printer
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400">
-            Upload PDF puis extraction Gemini en une passe (chaque lot est
-            rendu puis envoyé dès qu&apos;il est prêt).
+            Upload PDF, extraction Gemini par lots, puis relecture finale du
+            libretto.
           </p>
         </header>
 

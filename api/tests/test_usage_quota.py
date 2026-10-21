@@ -32,9 +32,9 @@ class UsageQuotaBatchesTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_batches_needed(self) -> None:
-        self.assertEqual(usage_quota.batches_needed(187), 38)
-        self.assertEqual(usage_quota.batches_needed(10), 2)
-        self.assertEqual(usage_quota.batches_needed(5), 1)
+        self.assertEqual(usage_quota.batches_needed(187), 39)
+        self.assertEqual(usage_quota.batches_needed(10), 3)
+        self.assertEqual(usage_quota.batches_needed(5), 2)
 
     def test_record_and_remaining(self) -> None:
         usage_quota.record_batch()
@@ -98,14 +98,14 @@ class UsageQuotaBatchesTests(unittest.TestCase):
 
     def test_needs_confirmation(self) -> None:
         usage_quota.record_batch()  # 2 remaining
-        check = usage_quota.needs_over_quota_confirmation(20)  # 4 batches
+        check = usage_quota.needs_over_quota_confirmation(20)  # 4 extract + 1 review
         self.assertTrue(check["requires_confirmation"])
-        self.assertEqual(check["batches_needed"], 4)
+        self.assertEqual(check["batches_needed"], 5)
         self.assertEqual(check["batches_remaining"], 2)
         self.assertIn("Continuer", check["message"] or "")
 
     def test_no_confirmation_when_enough(self) -> None:
-        check = usage_quota.needs_over_quota_confirmation(10)  # 2 batches, limit 3
+        check = usage_quota.needs_over_quota_confirmation(5)  # 1 extract + 1 review, limit 3
         self.assertFalse(check["requires_confirmation"])
 
     def test_next_reset_at_is_next_utc_midnight(self) -> None:

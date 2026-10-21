@@ -111,7 +111,7 @@ class SecurityHttpTests(unittest.TestCase):
         quota = self.client.get("/quota", params={"page_count": 20})
         self.assertEqual(quota.status_code, 200)
         q = quota.json()
-        self.assertEqual(q["batches_needed"], 4)
+        self.assertEqual(q["batches_needed"], 5)
         self.assertFalse(q["requires_confirmation"])
 
     def test_cors_allows_configured_origin(self) -> None:
@@ -281,9 +281,15 @@ class SecurityHttpTests(unittest.TestCase):
         session_id = self._make_ready_session(page_count=2)
         before = self.client.get("/quota").json()["batches_used"]
 
-        with patch(
-            "app.services.extract.gemini_client.extract_libretto_markdown",
-            return_value="# Titre\n\nTexte.\n",
+        with (
+            patch(
+                "app.services.extract.gemini_client.extract_libretto_markdown",
+                return_value="# Titre\n\nTexte.\n",
+            ),
+            patch(
+                "app.services.extract.gemini_client.review_libretto_markdown",
+                return_value="# Titre\n\nTexte revu.\n",
+            ),
         ):
             extract_service.write_libretto(session_id, "")
             now = datetime.now(timezone.utc).isoformat()
@@ -306,9 +312,14 @@ class SecurityHttpTests(unittest.TestCase):
             extract_service.run_extraction(session_id)
 
         after = self.client.get("/quota").json()["batches_used"]
-        self.assertEqual(after, before + 1)
+        self.assertEqual(after, before + 2)
         status = self.client.get(f"/extract/sessions/{session_id}/status")
-        self.assertEqual(status.json()["status"], "done")
+        body = status.json()
+        self.assertEqual(body["status"], "done")
+        self.assertEqual(body["phase"], "review")
+        self.assertTrue(body["review_done"])
+        libretto = self.client.get(f"/extract/sessions/{session_id}/libretto")
+        self.assertIn("Texte revu", libretto.json()["markdown"])
 
 
 if __name__ == "__main__":

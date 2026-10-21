@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,7 +45,11 @@ JobDict = dict[str, object]
 ACTIVE_STATUSES = frozenset({"running"})
 RESUMABLE_STATUSES = frozenset({"paused"})
 _VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
+_PHASE_EXTRACT = "extract"
+_PHASE_REVIEW = "review"
+_VALID_PHASES = frozenset({_PHASE_EXTRACT, _PHASE_REVIEW})
 _HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
+_STAFF_MARKER_RE = re.compile(r"(?m)^---.+---\s*\n?")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
 _queue_order: list[str] = []
@@ -77,20 +82,44 @@ def _as_int(value: object, default: int = 0) -> int:
     return default
 
 
+def _review_pending(job: JobDict) -> bool:
+    """True si les pages sont extraites mais la relecture finale n'est pas faite."""
+    if job.get("review_done") is True:
+        return False
+    if job.get("status") == "done":
+        return False
+    pages_done = _as_int(job.get("pages_done"))
+    page_count = _as_int(job.get("pdf_page_count"))
+    return page_count > 0 and pages_done >= page_count
+
+
+def _job_phase(job: JobDict) -> str:
+    if _review_pending(job):
+        return _PHASE_REVIEW
+    phase = job.get("phase")
+    if isinstance(phase, str) and phase in _VALID_PHASES:
+        return phase
+    return _PHASE_EXTRACT
+
+
 def _normalize_job(job: JobDict) -> JobDict:
     """Compat : started → running ; anciens pass1/pass2 → done/error."""
     status = job.get("status")
     if status == "started":
         job = dict(job)
         job["status"] = "running"
+        job["phase"] = _job_phase(job)
         return job
     if status in _VALID_STATUSES:
-        return job
+        out = dict(job)
+        out["phase"] = _job_phase(out)
+        return out
     job = dict(job)
     pages_done = _as_int(job.get("pages_done"))
     page_count = _as_int(job.get("pdf_page_count"))
     if status in {"pass1", "pass2"} and page_count > 0 and pages_done >= page_count:
         job["status"] = "done"
+        job["review_done"] = True
     else:
         job["status"] = "error"
         if not job.get("error"):
@@ -98,6 +127,7 @@ def _normalize_job(job: JobDict) -> JobDict:
                 f"Ancien statut '{status}' incompatible — "
                 "relancer POST /extract/sessions/{id}/start"
             )
+    job["phase"] = _job_phase(job)
     return job
 
 
@@ -309,6 +339,11 @@ def apply_section_update(markdown: str, updated_section: str) -> str:
     return f"{prefix}{updated}\n"
 
 
+def strip_staff_markers(markdown: str) -> str:
+    cleaned = _STAFF_MARKER_RE.sub("", markdown)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def is_worker_alive(session_id: str) -> bool:
     with _worker_lock:
         return session_id in _running_sessions
@@ -394,12 +429,14 @@ def start_job(session_id: str) -> JobDict:
     job: JobDict = {
         "session_id": session_id,
         "status": "running",
+        "phase": _PHASE_EXTRACT,
         "source_name": meta.source_name,
         "pdf_page_count": page_count,
         "batch_size": batch_size,
         "total_batches": _total_batches(page_count, batch_size),
         "pages_done": 0,
         "current_batch": 0,
+        "review_done": False,
         "error": None,
         "wait": None,
         "created_at": now,
@@ -483,7 +520,9 @@ def resume_job(
 
     pages_done = _as_int(job.get("pages_done"))
     page_count = _as_int(job.get("pdf_page_count"))
-    if page_count < 1 or pages_done >= page_count:
+    if page_count < 1 or (
+        pages_done >= page_count and not _review_pending(job)
+    ):
         raise HTTPException(
             status_code=400,
             detail="Extraction déjà terminée — rien à reprendre",
@@ -741,14 +780,18 @@ def _is_daily_resumable(job: JobDict) -> bool:
 
 
 def _is_failed_resumable(job: JobDict) -> bool:
-    """status=error sans pause daily, avec des pages encore à traiter."""
+    """status=error sans pause daily, avec extract ou review encore à faire."""
     if job.get("status") != "error":
         return False
     if _is_daily_resumable(job):
         return False
     pages_done = _as_int(job.get("pages_done"))
     page_count = _as_int(job.get("pdf_page_count"))
-    return page_count > 0 and pages_done < page_count
+    if page_count < 1:
+        return False
+    if pages_done < page_count:
+        return True
+    return _review_pending(job)
 
 
 def _pause_for_daily_quota(
@@ -949,8 +992,118 @@ def _ensure_batch_rendered(session_id: str, end_page: int) -> None:
         meta, _ = ingest_service.render_pdf_batch(session_id)
 
 
+def _mark_review_done(session_id: str, job: JobDict) -> None:
+    job["status"] = "done"
+    job["phase"] = _PHASE_REVIEW
+    job["review_done"] = True
+    job["pages_done"] = _as_int(job.get("pdf_page_count"))
+    job["current_batch"] = _as_int(job.get("total_batches"))
+    job["error"] = None
+    job["wait"] = None
+    _save_job(job)
+    logger.info("Extract done session=%s (review complete)", session_id[:8])
+
+
+def _run_final_review(
+    session_id: str,
+    on_wait: Callable[[QuotaSignal | None], None],
+) -> bool:
+    """
+    Relecture Gemini après extraction des pages.
+
+    True = terminé (ou libretto vide sauté) ; False = annulé / arrêté / erreur.
+    """
+    while True:
+        if is_cancelled(session_id):
+            logger.info("Extract cancelled session=%s", session_id[:8])
+            return False
+
+        job = _load_job(session_id)
+        if job is None:
+            return False
+        if job.get("review_done") is True or job.get("status") == "done":
+            return True
+
+        page_count = _as_int(job.get("pdf_page_count"))
+        job["status"] = "running"
+        job["phase"] = _PHASE_REVIEW
+        job["pages_done"] = page_count
+        job["current_batch"] = _as_int(job.get("total_batches"))
+        job["review_done"] = False
+        job["error"] = None
+        job["wait"] = None
+        _save_job(job)
+
+        current = read_libretto(session_id)
+        if not current.strip():
+            _mark_review_done(session_id, job)
+            return True
+
+        try:
+            logger.info(
+                "Review session=%s chars=%s",
+                session_id[:8],
+                len(current),
+            )
+            _pace_before_gemini(session_id)
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            usage_quota.assert_under_daily_limit()
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            reviewed = gemini_client.review_libretto_markdown(
+                current,
+                on_wait=on_wait,
+                should_abort=lambda: is_cancelled(session_id),
+            )
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            usage_quota.record_batch()
+            write_libretto(session_id, strip_staff_markers(reviewed))
+            job = _load_job(session_id) or job
+            _mark_review_done(session_id, job)
+            return True
+        except GeminiCancelledError:
+            logger.info("Extract cancelled session=%s", session_id[:8])
+            return False
+        except GeminiDailyQuotaError as exc:
+            if is_cancelled(session_id):
+                return False
+            job = _load_job(session_id) or job
+            if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
+                job["status"] = "error"
+                job["phase"] = _PHASE_REVIEW
+                job["error"] = MSG_QUOTA_MISCONFIGURED
+                job["wait"] = None
+                _save_job(job)
+                return False
+            _pause_for_daily_quota(session_id, job, exc)
+            if not _await_daily_quota_reset(session_id):
+                return False
+            continue
+        except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
+            if is_cancelled(session_id):
+                return False
+            logger.exception(
+                "Review failed session=%s: %s: %s",
+                session_id[:8],
+                type(exc).__name__,
+                exc,
+            )
+            job = _load_job(session_id) or job
+            job["status"] = "error"
+            job["phase"] = _PHASE_REVIEW
+            job["error"] = MSG_EXTRACT_FAILED
+            job["wait"] = None
+            _save_job(job)
+            return False
+
+
 def run_extraction(session_id: str) -> None:
-    """Passe unique : rendu d'un lot → Gemini → mise à jour libretto.md."""
+    """Passe extract (lots) puis relecture Gemini finale."""
     if is_cancelled(session_id):
         return
 
@@ -967,6 +1120,9 @@ def run_extraction(session_id: str) -> None:
 
     _leave_worker_queue(session_id)
     job["status"] = "running"
+    job["phase"] = (
+        _PHASE_REVIEW if _review_pending(job) else _PHASE_EXTRACT
+    )
     job["error"] = None
     job["wait"] = None
     _save_job(job)
@@ -976,6 +1132,10 @@ def run_extraction(session_id: str) -> None:
             _set_job_wait(session_id, signal)
 
     try:
+        if pages_done >= page_count and _review_pending(job):
+            _ = _run_final_review(session_id, on_wait)
+            return
+
         while pages_done < page_count:
             if is_cancelled(session_id):
                 logger.info("Extract cancelled session=%s", session_id[:8])
@@ -1030,6 +1190,7 @@ def run_extraction(session_id: str) -> None:
                 pages_done = end
                 job = _load_job(session_id) or job
                 job["status"] = "running"
+                job["phase"] = _PHASE_EXTRACT
                 job["pages_done"] = pages_done
                 job["current_batch"] = batch_index
                 job["error"] = None
@@ -1044,6 +1205,7 @@ def run_extraction(session_id: str) -> None:
                 job = _load_job(session_id) or job
                 if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
                     job["status"] = "error"
+                    job["phase"] = _PHASE_EXTRACT
                     job["error"] = MSG_QUOTA_MISCONFIGURED
                     job["wait"] = None
                     _save_job(job)
@@ -1053,6 +1215,7 @@ def run_extraction(session_id: str) -> None:
                     return
                 job = _load_job(session_id) or job
                 job["status"] = "running"
+                job["phase"] = _PHASE_EXTRACT
                 job["error"] = None
                 job["wait"] = None
                 _save_job(job)
@@ -1060,14 +1223,7 @@ def run_extraction(session_id: str) -> None:
 
         if is_cancelled(session_id):
             return
-        job = _load_job(session_id) or job
-        job["status"] = "done"
-        job["pages_done"] = page_count
-        job["current_batch"] = _as_int(job.get("total_batches"))
-        job["error"] = None
-        job["wait"] = None
-        _save_job(job)
-        logger.info("Extract done session=%s", session_id[:8])
+        _ = _run_final_review(session_id, on_wait)
     except GeminiCancelledError:
         logger.info("Extract cancelled session=%s", session_id[:8])
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
@@ -1081,6 +1237,7 @@ def run_extraction(session_id: str) -> None:
         )
         job = _load_job(session_id) or job
         job["status"] = "error"
+        job["phase"] = _job_phase(job)
         job["error"] = MSG_EXTRACT_FAILED
         job["wait"] = None
         _save_job(job)

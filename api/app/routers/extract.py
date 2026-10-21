@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Request
 
 from app.config import settings
 from app.schemas.extract import (
+    ExtractPhase,
     ExtractStartResponse,
     ExtractStatusResponse,
     ExtractWaitInfo,
@@ -42,16 +43,25 @@ def _batch_size_from_job(job: dict) -> int | None:
     return int(value) if value is not None else None
 
 
+def _phase_from_job(job: dict) -> ExtractPhase:
+    phase = job.get("phase")
+    if phase == "review":
+        return "review"
+    return "extract"
+
+
 def _start_like_response(job: dict) -> ExtractStartResponse:
     return ExtractStartResponse(
         session_id=job["session_id"],
         status=job["status"],
+        phase=_phase_from_job(job),
         source_name=job["source_name"],
         pdf_page_count=job["pdf_page_count"],
         batch_size=_batch_size_from_job(job) or 5,
         total_batches=job["total_batches"],
         pages_done=job["pages_done"],
         current_batch=job["current_batch"],
+        review_done=bool(job.get("review_done")),
         wait=_wait_from_job(job),
     )
 
@@ -83,12 +93,14 @@ def extract_status(session_id: str):
     return ExtractStatusResponse(
         session_id=job["session_id"],
         status=job["status"],
+        phase=_phase_from_job(job),
         source_name=job["source_name"],
         pdf_page_count=job.get("pdf_page_count"),
         batch_size=_batch_size_from_job(job),
         total_batches=job.get("total_batches"),
         pages_done=job.get("pages_done"),
         current_batch=job.get("current_batch"),
+        review_done=bool(job.get("review_done")),
         error=job.get("error"),
         wait=_wait_from_job(job),
         stale=bool(job.get("stale")),
@@ -107,5 +119,6 @@ def extract_libretto(session_id: str):
     return LibrettoResponse(
         session_id=job["session_id"],
         status=job["status"],
+        phase=_phase_from_job(job),
         markdown=markdown,
     )
