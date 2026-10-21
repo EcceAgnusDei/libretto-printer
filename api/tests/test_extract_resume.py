@@ -29,6 +29,7 @@ from app.services.gemini_errors import (  # noqa: E402
     GeminiCancelledError,
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
+    MSG_EXTRACT_FAILED,
     MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     next_gemini_reset_iso,
@@ -720,18 +721,28 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertIsNone(job.get("wait"))
         self.assertEqual(extract_service._queue_order, [])
 
-    def test_resume_rejects_non_daily_error(self) -> None:
+    def test_resume_accepts_non_daily_error(self) -> None:
         session_id = self._make_session(4)
         self._write_partial_job(session_id, pages_done=2, status="error")
         job = extract_service._load_job(session_id)
         assert job is not None
         job["wait"] = None
-        job["error"] = "ValueError: boom"
+        job["error"] = MSG_EXTRACT_FAILED
         extract_service._save_job(job)
+        before_md = extract_service.read_libretto(session_id)
 
-        with self.assertRaises(HTTPException) as ctx:
-            extract_service.resume_job(session_id)
-        self.assertEqual(ctx.exception.status_code, 400)
+        with (
+            patch.object(extract_service, "_spawn_worker") as spawn,
+            patch.object(usage_quota, "assert_under_daily_limit"),
+        ):
+            resumed = extract_service.resume_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(resumed["status"], "running")
+        self.assertEqual(resumed["pages_done"], 2)
+        self.assertIsNone(resumed["error"])
+        self.assertIsNone(resumed["wait"])
+        self.assertEqual(extract_service.read_libretto(session_id), before_md)
 
     def test_resume_accepts_legacy_error_daily(self) -> None:
         session_id = self._make_session(4)
@@ -947,6 +958,69 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertFalse(
             extract_service._is_daily_resumable({"status": "done", "wait": None})
         )
+
+    def test_is_failed_resumable_helpers(self) -> None:
+        self.assertTrue(
+            extract_service._is_failed_resumable(
+                {
+                    "status": "error",
+                    "wait": None,
+                    "pages_done": 1,
+                    "pdf_page_count": 4,
+                }
+            )
+        )
+        self.assertFalse(
+            extract_service._is_failed_resumable(
+                {
+                    "status": "error",
+                    "wait": {"reason": "daily"},
+                    "pages_done": 1,
+                    "pdf_page_count": 4,
+                }
+            )
+        )
+        self.assertFalse(
+            extract_service._is_failed_resumable(
+                {
+                    "status": "error",
+                    "wait": None,
+                    "pages_done": 4,
+                    "pdf_page_count": 4,
+                }
+            )
+        )
+        self.assertFalse(
+            extract_service._is_failed_resumable(
+                {
+                    "status": "paused",
+                    "wait": None,
+                    "pages_done": 1,
+                    "pdf_page_count": 4,
+                }
+            )
+        )
+
+    def test_start_on_error_routes_to_resume(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=2, status="error")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["wait"] = None
+        job["error"] = MSG_EXTRACT_FAILED
+        extract_service._save_job(job)
+        before_md = extract_service.read_libretto(session_id)
+
+        with (
+            patch.object(extract_service, "_spawn_worker") as spawn,
+            patch.object(usage_quota, "assert_under_daily_limit"),
+        ):
+            started = extract_service.start_job(session_id)
+
+        spawn.assert_called_once_with(session_id)
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["pages_done"], 2)
+        self.assertEqual(extract_service.read_libretto(session_id), before_md)
 
     def test_resume_gemini_blocked_before_wait_until(self) -> None:
         session_id = self._make_session(4)

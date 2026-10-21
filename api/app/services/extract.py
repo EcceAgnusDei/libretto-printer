@@ -373,13 +373,13 @@ def assert_preconditions(
 def start_job(session_id: str) -> JobDict:
     """Ouvre le job et lance la passe unique en arrière-plan.
 
-    Un job en pause quota (ou legacy error+daily) est repris via resume_job
-    pour ne pas écraser libretto.md / pages_done.
+    Un job en pause quota, en erreur repriseable (ou legacy error+daily)
+    est repris via resume_job pour ne pas écraser libretto.md / pages_done.
     """
     existing = _load_job(session_id)
     if existing is not None:
         normalized = _normalize_job(existing)
-        if _is_daily_resumable(normalized):
+        if _is_daily_resumable(normalized) or _is_failed_resumable(normalized):
             return resume_job(session_id)
 
     meta = assert_preconditions(session_id)
@@ -440,12 +440,23 @@ def _reject_if_wait_not_elapsed(job: JobDict) -> None:
     raise HTTPException(status_code=429, detail=detail)
 
 
+def _spawn_resume_worker(session_id: str, job: JobDict) -> JobDict:
+    job["status"] = "running"
+    job["error"] = None
+    job["wait"] = None
+    _clear_cancel(session_id)
+    _save_job(job)
+    _spawn_worker(session_id)
+    updated = _load_job(session_id)
+    return updated if updated is not None else job
+
+
 def resume_job(
     session_id: str,
     *,
     enforce_cooldown: bool = True,
 ) -> JobDict:
-    """Reprend une pause daily, ou réattache un worker orphelin (running stale)."""
+    """Reprend pause daily / erreur, ou réattache un worker orphelin."""
     _ = assert_preconditions(session_id, allow_active=True)
     if enforce_cooldown:
         _assert_resume_cooldown(session_id)
@@ -470,21 +481,39 @@ def resume_job(
         updated = _load_job(session_id)
         return updated if updated is not None else job
 
-    if not _is_daily_resumable(job):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Aucune pause quota journalier à reprendre "
-                f"(status={job.get('status')})"
-            ),
-        )
-
     pages_done = _as_int(job.get("pages_done"))
     page_count = _as_int(job.get("pdf_page_count"))
     if page_count < 1 or pages_done >= page_count:
         raise HTTPException(
             status_code=400,
             detail="Extraction déjà terminée — rien à reprendre",
+        )
+
+    if _is_failed_resumable(job):
+        try:
+            usage_quota.assert_under_daily_limit()
+        except GeminiDailyQuotaError:
+            job["status"] = "paused"
+            job["error"] = MSG_DAILY_QUOTA
+            job["wait"] = {
+                "reason": "daily",
+                "message": MSG_DAILY_QUOTA,
+                "wait_seconds": None,
+                "wait_until": usage_quota.next_reset_iso(),
+                "source": "server",
+            }
+            _save_job(job)
+            raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
+        logger.info("Extract resume after error session=%s", session_id[:8])
+        return _spawn_resume_worker(session_id, job)
+
+    if not _is_daily_resumable(job):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Aucune extraction à reprendre "
+                f"(status={job.get('status')})"
+            ),
         )
 
     raw_wait = job.get("wait")
@@ -525,14 +554,7 @@ def resume_job(
             _save_job(job)
             raise HTTPException(status_code=429, detail=MSG_DAILY_QUOTA)
 
-    job["status"] = "running"
-    job["error"] = None
-    job["wait"] = None
-    _clear_cancel(session_id)
-    _save_job(job)
-    _spawn_worker(session_id)
-    updated = _load_job(session_id)
-    return updated if updated is not None else job
+    return _spawn_resume_worker(session_id, job)
 
 
 def try_auto_resume(session_id: str) -> bool:
@@ -716,6 +738,17 @@ def _is_daily_resumable(job: JobDict) -> bool:
         return False
     wait = cast(JobDict, raw_wait)
     return status == "error" and wait.get("reason") == "daily"
+
+
+def _is_failed_resumable(job: JobDict) -> bool:
+    """status=error sans pause daily, avec des pages encore à traiter."""
+    if job.get("status") != "error":
+        return False
+    if _is_daily_resumable(job):
+        return False
+    pages_done = _as_int(job.get("pages_done"))
+    page_count = _as_int(job.get("pdf_page_count"))
+    return page_count > 0 and pages_done < page_count
 
 
 def _pause_for_daily_quota(

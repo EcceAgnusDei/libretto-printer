@@ -65,6 +65,15 @@ def start_extract(session_id: str):
     return _start_like_response(extract_service.start_job(session_id))
 
 
+@router.post(
+    "/sessions/{session_id}/resume",
+    response_model=ExtractStartResponse,
+    dependencies=[Depends(_rate_limit_extract_start)],
+)
+def resume_extract(session_id: str):
+    return _start_like_response(extract_service.resume_job(session_id))
+
+
 @router.get(
     "/sessions/{session_id}/status",
     response_model=ExtractStatusResponse,

@@ -14,6 +14,7 @@ import {
   deleteSession,
   fetchExtractStatus,
   fetchLibretto,
+  resumeExtraction,
   statusToStartResult,
   triggerExtraction,
   type ExtractStartResult,
@@ -392,6 +393,29 @@ export default function Home() {
     void deleteSession(sessionId);
   }
 
+  async function retryTracked(status: ExtractStatusResult): Promise<void> {
+    if (busy || extractBusy) return;
+    setError(null);
+    setPhase("extracting");
+    try {
+      const result = await resumeExtraction(status.sessionId);
+      const asStatus = startToStatus(result);
+      rememberFromStart(result);
+      setTracked((prev) => [
+        asStatus,
+        ...prev.filter((item) => item.sessionId !== result.sessionId),
+      ]);
+      setJob(result);
+      setLiveStatus(asStatus);
+      writeSessionIdToUrl(result.sessionId);
+      await syncLibretto(result.sessionId, result.pagesDone, { silent: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Échec de la reprise");
+    } finally {
+      setPhase("idle");
+    }
+  }
+
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0 || busy) return;
     setError(null);
@@ -578,6 +602,17 @@ export default function Home() {
                         >
                           {selected ? "Sélectionnée" : "Afficher"}
                         </button>
+                        {item.status === "error" &&
+                          !isDailyWaitStatus(item) && (
+                            <button
+                              type="button"
+                              onClick={() => void retryTracked(item)}
+                              disabled={busy || extractBusy}
+                              className="rounded-lg border border-current/30 bg-white/60 px-3 py-1.5 text-sm font-medium transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-black/20 dark:hover:bg-black/40"
+                            >
+                              Réessayer
+                            </button>
+                          )}
                         <button
                           type="button"
                           onClick={() => dismissTracked(item.sessionId)}

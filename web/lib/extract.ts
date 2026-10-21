@@ -183,6 +183,19 @@ async function startExtract(sessionId: string): Promise<ExtractStartResult> {
   return mapStartLike((await res.json()) as ExtractApiPayload);
 }
 
+export async function resumeExtraction(
+  sessionId: string,
+): Promise<ExtractStartResult> {
+  await assertGeminiReady();
+  const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/resume`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return mapStartLike((await res.json()) as ExtractApiPayload);
+}
+
 /** Annule l'extraction Gemini et supprime la session côté serveur. */
 export async function deleteSession(sessionId: string): Promise<void> {
   try {
