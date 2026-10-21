@@ -23,6 +23,8 @@ from app.services import extract as extract_service  # noqa: E402
 from app.services import gemini_client, usage_quota  # noqa: E402
 from app.services import ingest as ingest_service  # noqa: E402
 from app.services.extract import JobDict  # noqa: E402
+from app.routers import extract as extract_router  # noqa: E402
+from app.schemas.extract import ExtractWaitInfo  # noqa: E402
 from app.services.gemini_errors import (  # noqa: E402
     GeminiCancelledError,
     GeminiDailyQuotaError,
@@ -30,6 +32,7 @@ from app.services.gemini_errors import (  # noqa: E402
     MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
     next_gemini_reset_iso,
+    queue_wait_message,
 )
 
 
@@ -74,6 +77,7 @@ class ExtractResumeTests(unittest.TestCase):
         settings.extract_max_concurrent_workers = 2
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
+        extract_service._queue_order.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
@@ -82,6 +86,7 @@ class ExtractResumeTests(unittest.TestCase):
     def tearDown(self) -> None:
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
+        extract_service._queue_order.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
@@ -155,6 +160,26 @@ class ExtractResumeTests(unittest.TestCase):
             }
             if status in {"paused", "error"}
             else None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        extract_service._save_job(job)
+        return job
+
+    def _write_running_job(self, session_id: str, *, page_count: int = 2) -> JobDict:
+        now = datetime.now(timezone.utc).isoformat()
+        extract_service.write_libretto(session_id, "")
+        job: JobDict = {
+            "session_id": session_id,
+            "status": "running",
+            "source_name": "fixture.pdf",
+            "pdf_page_count": page_count,
+            "batch_size": page_count,
+            "total_batches": 1,
+            "pages_done": 0,
+            "current_batch": 0,
+            "error": None,
+            "wait": None,
             "created_at": now,
             "updated_at": now,
         }
@@ -311,6 +336,389 @@ class ExtractResumeTests(unittest.TestCase):
 
         self.assertEqual(max_seen, 1)
         self.assertEqual(extract_service._running_sessions, set())
+
+    def test_spawn_sets_queue_wait_with_position(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        extract_service.stop_worker_pool()
+        extract_service.start_worker_pool()
+
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        session_c = self._make_session(2)
+        now = datetime.now(timezone.utc).isoformat()
+        for session_id in (session_a, session_b, session_c):
+            extract_service.write_libretto(session_id, "")
+            extract_service._save_job(
+                {
+                    "session_id": session_id,
+                    "status": "running",
+                    "source_name": "fixture.pdf",
+                    "pdf_page_count": 2,
+                    "batch_size": 2,
+                    "total_batches": 1,
+                    "pages_done": 0,
+                    "current_batch": 0,
+                    "error": None,
+                    "wait": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return "# Queue\n\nTexte.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service._spawn_worker(session_a)
+            self.assertTrue(entered.wait(timeout=3.0))
+            extract_service._spawn_worker(session_b)
+            extract_service._spawn_worker(session_c)
+
+            job_b = extract_service._load_job(session_b)
+            job_c = extract_service._load_job(session_c)
+            assert job_b is not None and job_c is not None
+            wait_b = _wait_dict(job_b)
+            wait_c = _wait_dict(job_c)
+            self.assertEqual(wait_b["reason"], "queue")
+            self.assertEqual(wait_b["message"], queue_wait_message(1))
+            self.assertEqual(wait_b["source"], "server")
+            self.assertEqual(wait_c["reason"], "queue")
+            self.assertEqual(wait_c["message"], queue_wait_message(2))
+
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not extract_service._running_sessions:
+                    break
+                time.sleep(0.05)
+
+        job_a = extract_service._load_job(session_a)
+        assert job_a is not None
+        self.assertIsNone(job_a.get("wait"))
+        self.assertEqual(extract_service._queue_order, [])
+
+    def test_queue_wait_message_format(self) -> None:
+        self.assertEqual(queue_wait_message(1), "mise en file d'attente (1)")
+        self.assertEqual(queue_wait_message(3), "mise en file d'attente (3)")
+
+    def test_extract_wait_info_accepts_queue_reason(self) -> None:
+        info = ExtractWaitInfo(
+            reason="queue",
+            message=queue_wait_message(2),
+            wait_seconds=None,
+            wait_until=None,
+            source="server",
+        )
+        self.assertEqual(info.reason, "queue")
+        self.assertEqual(info.message, "mise en file d'attente (2)")
+
+    def test_wait_from_job_maps_queue(self) -> None:
+        mapped = extract_router._wait_from_job(
+            {
+                "wait": {
+                    "reason": "queue",
+                    "message": queue_wait_message(1),
+                    "wait_seconds": None,
+                    "wait_until": None,
+                    "source": "server",
+                }
+            }
+        )
+        assert mapped is not None
+        self.assertEqual(mapped.reason, "queue")
+        self.assertEqual(mapped.message, queue_wait_message(1))
+        self.assertEqual(mapped.source, "server")
+        self.assertIsNone(mapped.wait_seconds)
+        self.assertIsNone(mapped.wait_until)
+
+    def test_cancel_queued_session_refreshes_positions(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        extract_service.stop_worker_pool()
+        extract_service.start_worker_pool()
+
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        session_c = self._make_session(2)
+        for session_id in (session_a, session_b, session_c):
+            self._write_running_job(session_id)
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return "# Queue\n\nTexte.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service._spawn_worker(session_a)
+            self.assertTrue(entered.wait(timeout=3.0))
+            extract_service._spawn_worker(session_b)
+            extract_service._spawn_worker(session_c)
+
+            job_c_before = extract_service._load_job(session_c)
+            assert job_c_before is not None
+            self.assertEqual(
+                _wait_dict(job_c_before)["message"],
+                queue_wait_message(2),
+            )
+
+            extract_service.request_cancel(session_b)
+            self.assertNotIn(session_b, extract_service._queue_order)
+
+            job_b_after_cancel = extract_service._load_job(session_b)
+            assert job_b_after_cancel is not None
+            self.assertIsNone(job_b_after_cancel.get("wait"))
+
+            job_c_after = extract_service._load_job(session_c)
+            assert job_c_after is not None
+            wait_c_after = _wait_dict(job_c_after)
+            self.assertEqual(wait_c_after["reason"], "queue")
+            self.assertEqual(wait_c_after["message"], queue_wait_message(1))
+
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if session_a not in extract_service._running_sessions:
+                    break
+                time.sleep(0.05)
+
+        self.assertNotIn(session_b, extract_service._queue_order)
+
+    def test_enter_does_not_set_queue_wait_when_slots_free(self) -> None:
+        settings.extract_max_concurrent_workers = 2
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        self._write_running_job(session_a)
+        self._write_running_job(session_b)
+
+        _ = extract_service._enter_worker_queue(session_a)
+        _ = extract_service._enter_worker_queue(session_b)
+
+        job_a = extract_service._load_job(session_a)
+        job_b = extract_service._load_job(session_b)
+        assert job_a is not None and job_b is not None
+        self.assertIsNone(job_a.get("wait"))
+        self.assertIsNone(job_b.get("wait"))
+
+    def test_leave_queue_clears_wait_and_advances_next(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        self._write_running_job(session_a)
+        self._write_running_job(session_b)
+        busy_id = "b" * 32
+        extract_service._running_sessions.add(busy_id)
+
+        pos_a = extract_service._enter_worker_queue(session_a)
+        pos_b = extract_service._enter_worker_queue(session_b)
+        self.assertEqual(pos_a, 1)
+        self.assertEqual(pos_b, 2)
+        job_b_before = extract_service._load_job(session_b)
+        assert job_b_before is not None
+        self.assertEqual(
+            _wait_dict(job_b_before)["message"],
+            queue_wait_message(2),
+        )
+
+        extract_service._leave_worker_queue(session_a)
+        job_a_after = extract_service._load_job(session_a)
+        assert job_a_after is not None
+        self.assertIsNone(job_a_after.get("wait"))
+        job_b_after = extract_service._load_job(session_b)
+        assert job_b_after is not None
+        self.assertEqual(
+            _wait_dict(job_b_after)["message"],
+            queue_wait_message(1),
+        )
+        self.assertEqual(extract_service._queue_order, [session_b])
+
+        extract_service._leave_worker_queue(session_b)
+        job_b_left = extract_service._load_job(session_b)
+        assert job_b_left is not None
+        self.assertIsNone(job_b_left.get("wait"))
+        self.assertEqual(extract_service._queue_order, [])
+
+    def test_refresh_queue_waits_skips_non_queue_reason(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        self._write_running_job(session_a)
+        self._write_running_job(session_b)
+        busy_id = "b" * 32
+        extract_service._running_sessions.add(busy_id)
+        _ = extract_service._enter_worker_queue(session_a)
+        _ = extract_service._enter_worker_queue(session_b)
+
+        job_b = extract_service._load_job(session_b)
+        assert job_b is not None
+        job_b["wait"] = {
+            "reason": "rate_limit",
+            "message": MSG_RATE_LIMIT,
+            "wait_seconds": 5.0,
+            "wait_until": None,
+            "source": "gemini",
+        }
+        extract_service._save_job(job_b)
+
+        extract_service._leave_worker_queue(session_a)
+        job_b_after = extract_service._load_job(session_b)
+        assert job_b_after is not None
+        wait_b = _wait_dict(job_b_after)
+        self.assertEqual(wait_b["reason"], "rate_limit")
+        self.assertEqual(wait_b["message"], MSG_RATE_LIMIT)
+
+    def test_start_job_no_queue_wait_when_pool_idle(self) -> None:
+        settings.extract_max_concurrent_workers = 2
+        extract_service.stop_worker_pool()
+        extract_service.start_worker_pool()
+
+        session_id = self._make_session(2)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return "# Queue\n\nTexte.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            started = extract_service.start_job(session_id)
+            self.assertTrue(entered.wait(timeout=3.0))
+            self.assertIsNone(started.get("wait"))
+            status = extract_service.get_job(session_id)
+            self.assertIsNone(status.get("wait"))
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not extract_service._running_sessions:
+                    break
+                time.sleep(0.05)
+
+    def test_start_job_returns_queue_wait_when_pool_saturated(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        extract_service.stop_worker_pool()
+        extract_service.start_worker_pool()
+
+        session_a = self._make_session(2)
+        session_b = self._make_session(2)
+        self._write_running_job(session_a)
+
+        release = threading.Event()
+        entered = threading.Event()
+
+        def fake_extract(
+            _paths: object,
+            _section: str,
+            on_wait: object = None,
+            should_abort: object = None,
+        ) -> str:
+            entered.set()
+            self.assertTrue(release.wait(timeout=3.0))
+            return "# Queue\n\nTexte.\n"
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service._spawn_worker(session_a)
+            self.assertTrue(entered.wait(timeout=3.0))
+
+            started = extract_service.start_job(session_b)
+            wait = started.get("wait")
+            assert isinstance(wait, dict)
+            self.assertEqual(wait["reason"], "queue")
+            self.assertEqual(wait["message"], queue_wait_message(1))
+            self.assertEqual(wait["source"], "server")
+
+            status = extract_service.get_job(session_b)
+            status_wait = status.get("wait")
+            assert isinstance(status_wait, dict)
+            self.assertEqual(status_wait["reason"], "queue")
+            self.assertEqual(status_wait["message"], queue_wait_message(1))
+
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not extract_service._running_sessions:
+                    break
+                time.sleep(0.05)
+
+    def test_run_extraction_clears_queue_wait_on_start(self) -> None:
+        settings.extract_max_concurrent_workers = 1
+        session_id = self._make_session(2)
+        self._write_running_job(session_id)
+        extract_service._running_sessions.add("b" * 32)
+        _ = extract_service._enter_worker_queue(session_id)
+        job_before = extract_service._load_job(session_id)
+        assert job_before is not None
+        self.assertEqual(_wait_dict(job_before)["reason"], "queue")
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                return_value="# Done\n\nTexte.\n",
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service.run_extraction(session_id)
+
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "done")
+        self.assertIsNone(job.get("wait"))
+        self.assertEqual(extract_service._queue_order, [])
 
     def test_resume_rejects_non_daily_error(self) -> None:
         session_id = self._make_session(4)

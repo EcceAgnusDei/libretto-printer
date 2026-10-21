@@ -14,6 +14,11 @@ MSG_RESUME_COOLDOWN = "reprise trop fréquente, réessayez dans quelques seconde
 MSG_EXTRACT_FAILED = "échec de l'extraction, réessayez plus tard"
 MSG_QUOTA_MISCONFIGURED = "quota journalier non configuré"
 
+
+def queue_wait_message(position: int) -> str:
+    return f"mise en file d'attente ({position})"
+
+
 SAFE_CLIENT_ERROR_MESSAGES = frozenset(
     {
         MSG_RATE_LIMIT,

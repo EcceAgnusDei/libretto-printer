@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 ExtractStatus = Literal["running", "paused", "done", "error"]
-WaitReason = Literal["rate_limit", "daily"]
+WaitReason = Literal["rate_limit", "daily", "queue"]
 WaitSource = Literal["server", "gemini"]
 
 

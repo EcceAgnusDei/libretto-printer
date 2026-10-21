@@ -4,7 +4,7 @@ function apiBase(): string {
 
 export type ExtractJobStatus = "running" | "paused" | "done" | "error";
 
-export type ExtractWaitReason = "rate_limit" | "daily";
+export type ExtractWaitReason = "rate_limit" | "daily" | "queue";
 
 export type ExtractWaitSource = "server" | "gemini";
 

@@ -32,6 +32,7 @@ from app.services.gemini_errors import (
     next_gemini_reset_at,
     next_gemini_reset_iso,
     parse_wait_until,
+    queue_wait_message,
     wait_until_iso,
 )
 
@@ -46,6 +47,7 @@ _VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
 _HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
+_queue_order: list[str] = []
 _cancel_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
 _last_gemini_call_at: float | None = None
@@ -178,6 +180,85 @@ def _clear_cancel(session_id: str) -> None:
         _cancelled_sessions.discard(session_id)
 
 
+def _queue_wait_payload(position: int) -> JobDict:
+    return {
+        "reason": "queue",
+        "message": queue_wait_message(position),
+        "wait_seconds": None,
+        "wait_until": None,
+        "source": "server",
+    }
+
+
+def _queue_slot_saturated(position: int, extracting: int) -> bool:
+    max_workers = max(1, int(settings.extract_max_concurrent_workers))
+    return extracting + (position - 1) >= max_workers
+
+
+def _clear_queue_wait_if_present(session_id: str) -> None:
+    job = _load_job(session_id)
+    if job is None:
+        return
+    raw_wait = job.get("wait")
+    if not isinstance(raw_wait, dict) or raw_wait.get("reason") != "queue":
+        return
+    job["wait"] = None
+    _save_job(job)
+
+
+def _refresh_queue_waits() -> None:
+    """Recalcule wait.queue / position pour les sessions encore en file."""
+    with _worker_lock:
+        ordered = list(_queue_order)
+        extracting = len(_running_sessions - set(_queue_order))
+    for index, session_id in enumerate(ordered):
+        position = index + 1
+        should_wait = _queue_slot_saturated(position, extracting)
+        job = _load_job(session_id)
+        if job is None:
+            continue
+        raw_wait = job.get("wait")
+        wait = cast(JobDict, raw_wait) if isinstance(raw_wait, dict) else {}
+        if wait.get("reason") not in (None, "queue"):
+            continue
+        if job.get("status") != "running":
+            continue
+        if should_wait:
+            job["wait"] = _queue_wait_payload(position)
+        elif wait.get("reason") == "queue":
+            job["wait"] = None
+        else:
+            continue
+        _save_job(job)
+
+
+def _leave_worker_queue(session_id: str) -> None:
+    with _worker_lock:
+        if session_id not in _queue_order:
+            return
+        _queue_order.remove(session_id)
+    _clear_queue_wait_if_present(session_id)
+    _refresh_queue_waits()
+
+
+def _enter_worker_queue(session_id: str) -> int:
+    """Ajoute la session en file FIFO. Retourne la position 1-based."""
+    with _worker_lock:
+        if session_id not in _queue_order:
+            _queue_order.append(session_id)
+        position = _queue_order.index(session_id) + 1
+        extracting = len(_running_sessions - set(_queue_order))
+        should_wait = _queue_slot_saturated(position, extracting)
+    if should_wait:
+        job = _load_job(session_id)
+        if job is not None:
+            job["wait"] = _queue_wait_payload(position)
+            _save_job(job)
+    else:
+        _clear_queue_wait_if_present(session_id)
+    return position
+
+
 def request_cancel(session_id: str) -> None:
     """Stoppe les appels Gemini pour cette session (suppression / Retirer)."""
     _ = ingest_service.assert_safe_session_id(session_id)
@@ -185,6 +266,8 @@ def request_cancel(session_id: str) -> None:
         _cancelled_sessions.add(session_id)
     with _resume_lock:
         _resume_last_at.pop(session_id, None)
+    _leave_worker_queue(session_id)
+    _clear_queue_wait_if_present(session_id)
 
 
 def _total_batches(page_count: int, batch_size: int) -> int:
@@ -325,7 +408,8 @@ def start_job(session_id: str) -> JobDict:
     _clear_cancel(session_id)
     _save_job(job)
     _spawn_worker(session_id)
-    return job
+    updated = _load_job(session_id)
+    return updated if updated is not None else job
 
 
 def _assert_resume_cooldown(session_id: str) -> None:
@@ -383,7 +467,8 @@ def resume_job(
         _reject_if_wait_not_elapsed(job)
         _spawn_worker(session_id)
         logger.info("Extract reattach orphan worker session=%s", session_id[:8])
-        return job
+        updated = _load_job(session_id)
+        return updated if updated is not None else job
 
     if not _is_daily_resumable(job):
         raise HTTPException(
@@ -446,7 +531,8 @@ def resume_job(
     _clear_cancel(session_id)
     _save_job(job)
     _spawn_worker(session_id)
-    return job
+    updated = _load_job(session_id)
+    return updated if updated is not None else job
 
 
 def try_auto_resume(session_id: str) -> bool:
@@ -808,6 +894,7 @@ def _spawn_worker(session_id: str) -> None:
         with _worker_lock:
             _running_sessions.discard(session_id)
         return
+    _ = _enter_worker_queue(session_id)
     _ = pool.submit(_worker_entry, session_id)
 
 
@@ -815,6 +902,7 @@ def _worker_entry(session_id: str) -> None:
     try:
         run_extraction(session_id)
     finally:
+        _leave_worker_queue(session_id)
         with _worker_lock:
             _running_sessions.discard(session_id)
 
@@ -844,6 +932,7 @@ def run_extraction(session_id: str) -> None:
     )
     pages_done = _as_int(job.get("pages_done"))
 
+    _leave_worker_queue(session_id)
     job["status"] = "running"
     job["error"] = None
     job["wait"] = None

@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     extract_resume_cooldown_seconds: float = 5.0
     extract_supervisor_interval_seconds: float = 5.0
     extract_max_concurrent_workers: int = Field(
-        default=2,
+        default=1,
         validation_alias=AliasChoices(
             "EXTRACT_MAX_CONCURRENT_WORKERS",
             "extract_max_concurrent_workers",

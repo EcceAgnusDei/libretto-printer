@@ -84,6 +84,9 @@ function statusHeadline(status: ExtractStatusResult): string {
   if (status.stale) {
     return "Extraction interrompue — reprise automatique";
   }
+  if (status.wait?.reason === "queue") {
+    return status.wait.message || "mise en file d'attente";
+  }
   if (status.wait?.reason === "rate_limit") {
     return "Extraction ralentie — forte affluence";
   }
@@ -95,7 +98,10 @@ function statusToneClass(status: ExtractStatusResult): string {
   if (isDailyWaitStatus(status) || status.stale || status.status === "error") {
     return "border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200";
   }
-  if (status.wait?.reason === "rate_limit") {
+  if (
+    status.wait?.reason === "rate_limit" ||
+    status.wait?.reason === "queue"
+  ) {
     return "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100";
   }
   return "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200";
