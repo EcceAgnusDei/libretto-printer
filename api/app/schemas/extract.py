@@ -29,6 +29,7 @@ class ExtractStartResponse(BaseModel):
     pages_done: int
     current_batch: int
     review_done: bool = False
+    pdf_ready: bool = False
     wait: ExtractWaitInfo | None = None
 
 
@@ -43,6 +44,7 @@ class ExtractStatusResponse(BaseModel):
     pages_done: int | None = None
     current_batch: int | None = None
     review_done: bool = False
+    pdf_ready: bool = False
     error: str | None = None
     wait: ExtractWaitInfo | None = None
     stale: bool = False
@@ -55,3 +57,4 @@ class LibrettoResponse(BaseModel):
     status: ExtractStatus
     phase: ExtractPhase = "extract"
     markdown: str
+    pdf_ready: bool = False

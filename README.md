@@ -109,6 +109,7 @@ Endpoints :
 - `POST /extract/sessions/{id}/start`
 - `GET /extract/sessions/{id}/status`
 - `GET /extract/sessions/{id}/libretto`
+- `GET /extract/sessions/{id}/pdf` — télécharge le PDF généré juste après la relecture (`pdf_ready`)
 
 ### Tester
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import FileResponse
 
 from app.config import settings
 from app.schemas.extract import (
@@ -10,6 +11,7 @@ from app.schemas.extract import (
     ExtractWaitInfo,
     LibrettoResponse,
 )
+from app.services import export_pdf as export_pdf_service
 from app.services import extract as extract_service
 from app.services import rate_limit
 
@@ -62,6 +64,7 @@ def _start_like_response(job: dict) -> ExtractStartResponse:
         pages_done=job["pages_done"],
         current_batch=job["current_batch"],
         review_done=bool(job.get("review_done")),
+        pdf_ready=bool(job.get("pdf_ready")),
         wait=_wait_from_job(job),
     )
 
@@ -101,6 +104,7 @@ def extract_status(session_id: str):
         pages_done=job.get("pages_done"),
         current_batch=job.get("current_batch"),
         review_done=bool(job.get("review_done")),
+        pdf_ready=bool(job.get("pdf_ready")),
         error=job.get("error"),
         wait=_wait_from_job(job),
         stale=bool(job.get("stale")),
@@ -121,4 +125,22 @@ def extract_libretto(session_id: str):
         status=job["status"],
         phase=_phase_from_job(job),
         markdown=markdown,
+        pdf_ready=bool(job.get("pdf_ready")),
+    )
+
+
+@router.get("/sessions/{session_id}/pdf")
+def extract_libretto_pdf(session_id: str) -> FileResponse:
+    job = extract_service.get_job(session_id)
+    markdown = extract_service.read_libretto(session_id)
+    pdf_path, download_name = export_pdf_service.get_libretto_pdf(
+        session_id,
+        markdown_text=markdown,
+        source_name=str(job.get("source_name") or "libretto"),
+        pdf_ready=bool(job.get("pdf_ready")),
+    )
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=download_name,
     )

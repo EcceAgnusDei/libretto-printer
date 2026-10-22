@@ -7,3 +7,6 @@ pymupdf
 pillow
 google-genai
 tzdata
+weasyprint
+markdown
+bleach

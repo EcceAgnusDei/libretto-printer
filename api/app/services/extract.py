@@ -25,6 +25,7 @@ from app.services.gemini_errors import (
     GeminiDailyQuotaError,
     MSG_DAILY_QUOTA,
     MSG_EXTRACT_FAILED,
+    MSG_PDF_FAILED,
     MSG_QUOTA_MISCONFIGURED,
     MSG_RATE_LIMIT,
     MSG_RESUME_COOLDOWN,
@@ -425,6 +426,9 @@ def start_job(session_id: str) -> JobDict:
     now = _now_iso()
 
     write_libretto(session_id, "")
+    from app.services import export_pdf as export_pdf_service
+
+    export_pdf_service.clear_libretto_pdf(session_id)
 
     job: JobDict = {
         "session_id": session_id,
@@ -437,6 +441,7 @@ def start_job(session_id: str) -> JobDict:
         "pages_done": 0,
         "current_batch": 0,
         "review_done": False,
+        "pdf_ready": False,
         "error": None,
         "wait": None,
         "created_at": now,
@@ -520,6 +525,30 @@ def resume_job(
 
     pages_done = _as_int(job.get("pages_done"))
     page_count = _as_int(job.get("pdf_page_count"))
+    if (
+        bool(job.get("review_done"))
+        and not bool(job.get("pdf_ready"))
+        and page_count > 0
+    ):
+        from app.services import export_pdf as export_pdf_service
+
+        if export_pdf_service.is_libretto_pdf_ready(session_id):
+            job["pdf_ready"] = True
+            job["error"] = None
+            _save_job(job)
+            return job
+        try:
+            _generate_pdf_after_review(session_id, job)
+        except Exception:
+            logger.exception("PDF generation failed session=%s", session_id[:8])
+            job = _load_job(session_id) or job
+            job["pdf_ready"] = False
+            job["error"] = MSG_PDF_FAILED
+            _save_job(job)
+            raise HTTPException(status_code=500, detail=MSG_PDF_FAILED)
+        updated = _load_job(session_id)
+        return updated if updated is not None else job
+
     if page_count < 1 or (
         pages_done >= page_count and not _review_pending(job)
     ):
@@ -639,7 +668,12 @@ def _session_last_activity_ts(session_id: str) -> float:
         newest = base.stat().st_mtime
     except OSError:
         return 0.0
-    for name in ("meta.json", "extract_job.json", "libretto.md"):
+    for name in (
+        "meta.json",
+        "extract_job.json",
+        "libretto.md",
+        "libretto.pdf",
+    ):
         path = base / name
         try:
             newest = max(newest, path.stat().st_mtime)
@@ -937,6 +971,14 @@ def get_job(session_id: str) -> JobDict:
             detail="Aucune extraction démarrée pour cette session",
         )
     normalized = _normalize_job(job)
+    from app.services import export_pdf as export_pdf_service
+
+    if bool(normalized.get("review_done")) and export_pdf_service.is_libretto_pdf_ready(
+        session_id
+    ):
+        normalized["pdf_ready"] = True
+    else:
+        normalized["pdf_ready"] = bool(normalized.get("pdf_ready"))
     normalized["stale"] = job_is_stale(normalized)
     raw_error = normalized.get("error")
     if isinstance(raw_error, str):
@@ -992,16 +1034,43 @@ def _ensure_batch_rendered(session_id: str, end_page: int) -> None:
         meta, _ = ingest_service.render_pdf_batch(session_id)
 
 
+def _generate_pdf_after_review(session_id: str, job: JobDict) -> None:
+    from app.services import export_pdf as export_pdf_service
+
+    markdown_text = read_libretto(session_id)
+    source_name = str(job.get("source_name") or "libretto")
+    export_pdf_service.write_libretto_pdf(
+        session_id,
+        markdown_text,
+        source_name,
+    )
+    fresh = _load_job(session_id) or job
+    fresh["pdf_ready"] = True
+    if fresh.get("error") == MSG_PDF_FAILED:
+        fresh["error"] = None
+    _save_job(fresh)
+    logger.info("PDF ready session=%s", session_id[:8])
+
+
 def _mark_review_done(session_id: str, job: JobDict) -> None:
     job["status"] = "done"
     job["phase"] = _PHASE_REVIEW
     job["review_done"] = True
+    job["pdf_ready"] = False
     job["pages_done"] = _as_int(job.get("pdf_page_count"))
     job["current_batch"] = _as_int(job.get("total_batches"))
     job["error"] = None
     job["wait"] = None
     _save_job(job)
     logger.info("Extract done session=%s (review complete)", session_id[:8])
+    try:
+        _generate_pdf_after_review(session_id, job)
+    except Exception:
+        logger.exception("PDF generation failed session=%s", session_id[:8])
+        fresh = _load_job(session_id) or job
+        fresh["pdf_ready"] = False
+        fresh["error"] = MSG_PDF_FAILED
+        _save_job(fresh)
 
 
 def _run_final_review(
@@ -1022,6 +1091,19 @@ def _run_final_review(
         if job is None:
             return False
         if job.get("review_done") is True or job.get("status") == "done":
+            if not bool(job.get("pdf_ready")):
+                try:
+                    _generate_pdf_after_review(session_id, job)
+                except Exception:
+                    logger.exception(
+                        "PDF generation failed session=%s",
+                        session_id[:8],
+                    )
+                    fresh = _load_job(session_id) or job
+                    fresh["pdf_ready"] = False
+                    fresh["error"] = MSG_PDF_FAILED
+                    _save_job(fresh)
+                    return False
             return True
 
         page_count = _as_int(job.get("pdf_page_count"))
@@ -1030,6 +1112,7 @@ def _run_final_review(
         job["pages_done"] = page_count
         job["current_batch"] = _as_int(job.get("total_batches"))
         job["review_done"] = False
+        job["pdf_ready"] = False
         job["error"] = None
         job["wait"] = None
         _save_job(job)

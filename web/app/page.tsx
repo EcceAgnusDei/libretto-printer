@@ -12,6 +12,7 @@ import {
 } from "../lib/apiConfig";
 import {
   deleteSession,
+  downloadLibrettoPdf,
   fetchExtractStatus,
   fetchLibretto,
   resumeExtraction,
@@ -65,10 +66,18 @@ function startToStatus(result: ExtractStartResult): ExtractStatusResult {
     pagesDone: result.pagesDone,
     currentBatch: result.currentBatch,
     reviewDone: result.reviewDone,
+    pdfReady: result.pdfReady,
     error: null,
     wait: result.wait,
     stale: false,
   };
+}
+
+function needsStatusPoll(status: ExtractStatusResult): boolean {
+  if (status.status === "running" || status.status === "paused" || status.stale) {
+    return true;
+  }
+  return status.status === "done" && status.reviewDone && !status.pdfReady;
 }
 
 function isDailyWaitStatus(status: ExtractStatusResult): boolean {
@@ -80,7 +89,15 @@ function isDailyWaitStatus(status: ExtractStatusResult): boolean {
 }
 
 function statusHeadline(status: ExtractStatusResult): string {
-  if (status.status === "done") return "Extraction terminée";
+  if (status.status === "done") {
+    if (status.reviewDone && status.pdfReady) {
+      return "Libretto prêt — PDF disponible";
+    }
+    if (status.reviewDone) {
+      return "Relecture terminée — génération du PDF…";
+    }
+    return "Extraction terminée";
+  }
   if (isDailyWaitStatus(status)) {
     return status.phase === "review"
       ? "Quota journalier atteint — la relecture reprendra demain"
@@ -135,6 +152,7 @@ export default function Home() {
   const [tracked, setTracked] = useState<ExtractStatusResult[]>([]);
   const [librettoMd, setLibrettoMd] = useState<string | null>(null);
   const [quotaConfirm, setQuotaConfirm] = useState<QuotaCheck | null>(null);
+  const [pdfDownloading, setPdfDownloading] = useState(false);
   const [restoring, setRestoring] = useState(true);
   const userStartedDuringRestoreRef = useRef(false);
   const librettoSyncRef = useRef<{
@@ -147,6 +165,24 @@ export default function Home() {
   const busy = phase !== "idle" || restoring;
   const extractBusy =
     liveStatus?.status === "running" && liveStatus.stale !== true;
+  const pdfReady = liveStatus?.pdfReady === true;
+  const pdfPending =
+    liveStatus?.status === "done" &&
+    liveStatus.reviewDone === true &&
+    !pdfReady;
+
+  async function onDownloadPdf() {
+    if (!job || !pdfReady || pdfDownloading) return;
+    setPdfDownloading(true);
+    setError(null);
+    try {
+      await downloadLibrettoPdf(job.sessionId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Téléchargement PDF échoué");
+    } finally {
+      setPdfDownloading(false);
+    }
+  }
 
   async function syncLibretto(
     sessionId: string,
@@ -306,18 +342,9 @@ export default function Home() {
   const pollSessionIds = [
     ...new Set([
       ...tracked
-        .filter(
-          (item) =>
-            item.status === "running" ||
-            item.status === "paused" ||
-            item.stale,
-        )
+        .filter((item) => needsStatusPoll(item))
         .map((item) => item.sessionId),
-      ...(job &&
-      liveStatus &&
-      (liveStatus.status === "running" ||
-        liveStatus.status === "paused" ||
-        liveStatus.stale)
+      ...(job && liveStatus && needsStatusPoll(liveStatus)
         ? [job.sessionId]
         : []),
     ]),
@@ -383,6 +410,12 @@ export default function Home() {
         if (!isDaily) {
           setError(selected.error ?? "Extraction échouée");
         }
+      } else if (
+        selected.status === "done" &&
+        selected.error &&
+        !selected.pdfReady
+      ) {
+        setError(selected.error);
       }
     }
 
@@ -802,9 +835,32 @@ export default function Home() {
 
         {librettoMd !== null && (
           <section className="space-y-2">
-            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-              libretto.md
-            </h2>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+                libretto.md
+              </h2>
+              {pdfReady && (
+                <button
+                  type="button"
+                  onClick={() => void onDownloadPdf()}
+                  disabled={pdfDownloading}
+                  className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                >
+                  {pdfDownloading ? "Téléchargement…" : "Télécharger le PDF"}
+                </button>
+              )}
+            </div>
+            {pdfPending && (
+              <p className="text-xs text-zinc-500">Génération du PDF…</p>
+            )}
+            {!pdfReady &&
+              !pdfPending &&
+              liveStatus &&
+              liveStatus.status !== "done" && (
+                <p className="text-xs text-zinc-500">
+                  Le PDF sera disponible après la relecture finale.
+                </p>
+              )}
             <pre className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-xs leading-relaxed whitespace-pre-wrap text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
               {librettoMd || "(vide)"}
             </pre>

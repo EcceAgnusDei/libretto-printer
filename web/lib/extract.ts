@@ -30,6 +30,7 @@ export type ExtractStartResult = {
   pagesDone: number;
   currentBatch: number;
   reviewDone: boolean;
+  pdfReady: boolean;
   wait: ExtractWaitInfo | null;
 };
 
@@ -44,6 +45,7 @@ export type ExtractStatusResult = {
   pagesDone: number | null;
   currentBatch: number | null;
   reviewDone: boolean;
+  pdfReady: boolean;
   error: string | null;
   wait: ExtractWaitInfo | null;
   stale: boolean;
@@ -64,6 +66,7 @@ export function statusToStartResult(
     pagesDone: status.pagesDone ?? 0,
     currentBatch: status.currentBatch ?? 0,
     reviewDone: status.reviewDone,
+    pdfReady: status.pdfReady,
     wait: status.wait,
   };
 }
@@ -101,6 +104,7 @@ type ExtractApiPayload = {
   pages_done: number;
   current_batch: number;
   review_done?: boolean;
+  pdf_ready?: boolean;
   wait?: {
     reason: ExtractWaitReason;
     message: string;
@@ -127,6 +131,7 @@ function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
     reviewDone: Boolean(data.review_done),
+    pdfReady: Boolean(data.pdf_ready),
     wait: mapWait(data.wait),
   };
 }
@@ -253,6 +258,7 @@ export async function fetchExtractStatus(
     pages_done: number | null;
     current_batch: number | null;
     review_done?: boolean;
+    pdf_ready?: boolean;
     error: string | null;
     stale?: boolean;
     wait?: {
@@ -274,6 +280,7 @@ export async function fetchExtractStatus(
     pagesDone: data.pages_done,
     currentBatch: data.current_batch,
     reviewDone: Boolean(data.review_done),
+    pdfReady: Boolean(data.pdf_ready),
     error: data.error,
     wait: mapWait(data.wait),
     stale: Boolean(data.stale),
@@ -295,4 +302,46 @@ export async function fetchLibretto(sessionId: string): Promise<{
     markdown: string;
   };
   return { status: data.status, markdown: data.markdown };
+}
+
+function filenameFromContentDisposition(
+  header: string | null,
+  fallback: string,
+): string {
+  if (!header) return fallback;
+  const utf = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header);
+  if (utf?.[1]) {
+    try {
+      return decodeURIComponent(utf[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      // ignore
+    }
+  }
+  const plain = /filename\s*=\s*("?)([^";]+)\1/i.exec(header);
+  if (plain?.[2]) return plain[2].trim();
+  return fallback;
+}
+
+export async function downloadLibrettoPdf(sessionId: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/pdf`);
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  const blob = await res.blob();
+  const filename = filenameFromContentDisposition(
+    res.headers.get("Content-Disposition"),
+    "libretto.pdf",
+  );
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
