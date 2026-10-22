@@ -78,10 +78,15 @@ class ExtractResumeTests(unittest.TestCase):
         settings.extract_max_concurrent_workers = 2
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
+        extract_service._active_workers.clear()
+        extract_service._worker_generation.clear()
+        extract_service._active_generation.clear()
         extract_service._queue_order.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
+        extract_service._last_wall_time = None
+        extract_service._last_monotonic_time = None
         self._review_patcher = patch.object(
             gemini_client,
             "review_libretto_markdown",
@@ -96,10 +101,16 @@ class ExtractResumeTests(unittest.TestCase):
             patcher.stop()
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
+        extract_service._active_workers.clear()
+        extract_service._worker_generation.clear()
+        extract_service._active_generation.clear()
         extract_service._queue_order.clear()
         extract_service._cancelled_sessions.clear()
         extract_service._last_gemini_call_at = None
         extract_service._resume_last_at.clear()
+        extract_service._last_wall_time = None
+        extract_service._last_monotonic_time = None
+        gemini_client._client = None
         assert self._old_data is not None
         assert self._old_key is not None
         assert self._old_batch is not None
@@ -311,6 +322,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             nonlocal active, max_seen
             with lock:
@@ -383,6 +395,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             entered.set()
             self.assertTrue(release.wait(timeout=3.0))
@@ -478,6 +491,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             entered.set()
             self.assertTrue(release.wait(timeout=3.0))
@@ -623,6 +637,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             entered.set()
             self.assertTrue(release.wait(timeout=3.0))
@@ -666,6 +681,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             entered.set()
             self.assertTrue(release.wait(timeout=3.0))
@@ -833,7 +849,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "## Acte I\n\nLot 1.\n"
@@ -927,7 +943,7 @@ class ExtractResumeTests(unittest.TestCase):
         self._write_partial_job(session_id, pages_done=2, source="gemini")
         seen_starts: list[int] = []
 
-        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
             start = int(image_paths[0].stem.split("_")[1])
             seen_starts.append(start)
             return f"{section}\nPage {start}.\n"
@@ -1284,7 +1300,7 @@ class ExtractResumeTests(unittest.TestCase):
         )
         reset = next_gemini_reset_iso()
 
-        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
             raise GeminiDailyQuotaError(
                 MSG_DAILY_QUOTA,
                 source="gemini",
@@ -1341,7 +1357,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return "## Acte I\n\nLot 1.\n"
@@ -1400,7 +1416,7 @@ class ExtractResumeTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None):
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise GeminiDailyQuotaError(
@@ -1572,6 +1588,7 @@ class ExtractResumeTests(unittest.TestCase):
             _section: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             calls["n"] += 1
             return "# Cancelled\n"
@@ -1633,6 +1650,7 @@ class ExtractResumeTests(unittest.TestCase):
             markdown: str,
             on_wait: object = None,
             should_abort: object = None,
+            **_kwargs: object,
         ) -> str:
             review_calls.append(markdown)
             return "# Revu\n\n**A.** hello\n"
@@ -1702,6 +1720,202 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertEqual(job["status"], "running")
         self.assertEqual(job["pages_done"], 2)
         self.assertFalse(job.get("review_done"))
+
+    def _running_job(
+        self,
+        session_id: str,
+        *,
+        pages_done: int,
+        updated_at: str,
+        wait: dict[str, object] | None = None,
+    ) -> None:
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "phase": "extract",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": 4,
+                "batch_size": 2,
+                "total_batches": 2,
+                "pages_done": pages_done,
+                "current_batch": 1,
+                "review_done": False,
+                "error": None,
+                "wait": wait,
+                "created_at": updated_at,
+                "updated_at": updated_at,
+            }
+        )
+
+    def _mark_worker_active(self, session_id: str, generation: int = 1) -> None:
+        extract_service._running_sessions.add(session_id)
+        extract_service._active_workers.add(session_id)
+        extract_service._worker_generation[session_id] = generation
+        extract_service._active_generation[session_id] = generation
+
+    def test_connection_failure_is_retryable(self) -> None:
+        self.assertTrue(
+            gemini_client._is_retryable(
+                ConnectionResetError("Connection reset by peer")
+            )
+        )
+        self.assertTrue(
+            gemini_client._is_retryable(TimeoutError("The read operation timed out"))
+        )
+        self.assertFalse(
+            gemini_client._is_retryable(ValueError("Réponse Gemini vide"))
+        )
+
+    def test_gemini_client_sets_http_timeout(self) -> None:
+        previous = settings.gemini_request_timeout_seconds
+        settings.gemini_request_timeout_seconds = 300
+        gemini_client._client = None
+        try:
+            with patch.object(
+                gemini_client.genai, "Client", return_value=MagicMock()
+            ) as ctor:
+                _ = gemini_client._get_client()
+            http_options = ctor.call_args.kwargs["http_options"]
+            self.assertEqual(http_options.timeout, 300_000)
+        finally:
+            settings.gemini_request_timeout_seconds = previous
+            gemini_client._client = None
+
+    def test_recent_live_worker_is_not_stale(self) -> None:
+        session_id = self._make_session(4)
+        now = datetime.now(timezone.utc).isoformat()
+        self._running_job(session_id, pages_done=2, updated_at=now)
+        self._mark_worker_active(session_id)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertFalse(extract_service.worker_is_stalled(job))
+        self.assertFalse(extract_service.job_is_stale(job))
+
+    def test_rate_limit_wait_is_not_stalled(self) -> None:
+        session_id = self._make_session(4)
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self._running_job(
+            session_id,
+            pages_done=2,
+            updated_at=old,
+            wait={
+                "reason": "rate_limit",
+                "message": MSG_RATE_LIMIT,
+                "wait_seconds": 30,
+                "wait_until": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "source": "gemini",
+            },
+        )
+        self._mark_worker_active(session_id)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertFalse(extract_service.worker_is_stalled(job))
+
+    def test_reconcile_abandons_stalled_worker_and_resumes(self) -> None:
+        session_id = self._make_session(4)
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        with patch.object(extract_service, "_now_iso", return_value=old):
+            self._running_job(session_id, pages_done=2, updated_at=old)
+        self._mark_worker_active(session_id)
+        previous_timeout = settings.gemini_request_timeout_seconds
+        previous_grace = settings.extract_stall_grace_seconds
+        settings.gemini_request_timeout_seconds = 30
+        settings.extract_stall_grace_seconds = 0
+        try:
+            with (
+                patch.object(extract_service, "_spawn_worker") as spawn,
+                patch.object(gemini_client, "close_client") as close,
+            ):
+                count = extract_service.reconcile_orphaned_jobs()
+        finally:
+            settings.gemini_request_timeout_seconds = previous_timeout
+            settings.extract_stall_grace_seconds = previous_grace
+        self.assertEqual(count, 1)
+        spawn.assert_called_once_with(session_id)
+        close.assert_called_once()
+        self.assertNotIn(session_id, extract_service._active_workers)
+        self.assertGreater(extract_service._worker_generation[session_id], 1)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["pages_done"], 2)
+        self.assertEqual(job["status"], "running")
+
+    def test_reconcile_abandons_worker_after_system_resume(self) -> None:
+        session_id = self._make_session(4)
+        now = datetime.now(timezone.utc).isoformat()
+        self._running_job(session_id, pages_done=2, updated_at=now)
+        self._mark_worker_active(session_id)
+        extract_service._last_wall_time = time.time() - 90
+        extract_service._last_monotonic_time = time.monotonic() - 1
+        with (
+            patch.object(extract_service, "_spawn_worker") as spawn,
+            patch.object(gemini_client, "close_client") as close,
+        ):
+            count = extract_service.reconcile_orphaned_jobs()
+        self.assertEqual(count, 1)
+        spawn.assert_called_once_with(session_id)
+        close.assert_called_once()
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["pages_done"], 2)
+
+    def test_system_resume_keeps_rate_limit_wait(self) -> None:
+        session_id = self._make_session(4)
+        now = datetime.now(timezone.utc).isoformat()
+        self._running_job(
+            session_id,
+            pages_done=2,
+            updated_at=now,
+            wait={
+                "reason": "rate_limit",
+                "message": MSG_RATE_LIMIT,
+                "wait_seconds": 30,
+                "wait_until": (
+                    datetime.now(timezone.utc) + timedelta(seconds=30)
+                ).isoformat(),
+                "source": "gemini",
+            },
+        )
+        self._mark_worker_active(session_id)
+        extract_service._last_wall_time = time.time() - 90
+        extract_service._last_monotonic_time = time.monotonic() - 1
+        with (
+            patch.object(extract_service, "_spawn_worker") as spawn,
+            patch.object(gemini_client, "close_client") as close,
+        ):
+            count = extract_service.reconcile_orphaned_jobs()
+        self.assertEqual(count, 0)
+        spawn.assert_not_called()
+        close.assert_not_called()
+        self.assertIn(session_id, extract_service._active_workers)
+
+    def test_superseded_worker_does_not_mark_error(self) -> None:
+        session_id = self._make_session(4)
+        now = datetime.now(timezone.utc).isoformat()
+        self._running_job(session_id, pages_done=2, updated_at=now)
+        extract_service.write_libretto(session_id, "## Acte I\n\nTexte.\n")
+        extract_service._worker_generation[session_id] = 1
+
+        def abandon_then_fail(*_args: object, **_kwargs: object) -> str:
+            extract_service._worker_generation[session_id] = 2
+            raise TimeoutError("The read operation timed out")
+
+        with patch.object(
+            gemini_client,
+            "extract_libretto_markdown",
+            side_effect=abandon_then_fail,
+        ):
+            extract_service.run_extraction(session_id, 1)
+
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "running")
+        self.assertIsNone(job["error"])
+        self.assertEqual(job["pages_done"], 2)
+        self.assertIn("Texte", extract_service.read_libretto(session_id))
 
     def test_strip_staff_markers(self) -> None:
         raw = "# Titre\n\n**A.** hi\n---A---\n---(aucun)---\n\n**B.** yo\n"

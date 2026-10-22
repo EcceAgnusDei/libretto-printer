@@ -45,6 +45,8 @@ class Settings(BaseSettings):
         ),
     )
     gemini_min_interval_seconds: float = 5.0
+    gemini_request_timeout_seconds: float = 300.0
+    extract_stall_grace_seconds: float = 60.0
     gemini_quota_timezone: str = "America/Los_Angeles"
     gemini_max_batches_per_day: int = Field(
         default=100,

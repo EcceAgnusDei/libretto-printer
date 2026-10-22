@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -80,16 +81,57 @@ Règles :
 _FENCE_RE = re.compile(r"^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$", re.IGNORECASE)
 
 _client: genai.Client | None = None
+_client_lock = threading.Lock()
 
 WaitCallback = Callable[[QuotaSignal | None], None]
 AbortCheck = Callable[[], bool]
+AttemptCallback = Callable[[], None]
+
+_RETRYABLE_TOKENS = (
+    "timeout",
+    "timed out",
+    "unavailable",
+    "resourceexhausted",
+    "disconnect",
+    "connection reset",
+    "broken pipe",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "remoteprotocol",
+    "network",
+    "429",
+    "503",
+)
 
 
 def _get_client() -> genai.Client:
     global _client
-    if _client is None:
-        _client = genai.Client(api_key=settings.gemini_api_key.strip())
-    return _client
+    with _client_lock:
+        if _client is None:
+            timeout_ms = int(settings.gemini_request_timeout_seconds * 1000)
+            http_options = (
+                types.HttpOptions(timeout=timeout_ms) if timeout_ms > 0 else None
+            )
+            _client = genai.Client(
+                api_key=settings.gemini_api_key.strip(),
+                http_options=http_options,
+            )
+        return _client
+
+
+def close_client() -> None:
+    """Ferme le client HTTP pour débloquer un appel resté pendu (veille)."""
+    global _client
+    with _client_lock:
+        client = _client
+        _client = None
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        logger.warning("Gemini client close failed", exc_info=True)
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -100,10 +142,7 @@ def _is_retryable(exc: BaseException) -> bool:
         return True
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
-    return any(
-        token in name or token in msg
-        for token in ("timeout", "unavailable", "resourceexhausted", "429", "503")
-    )
+    return any(token in name or token in msg for token in _RETRYABLE_TOKENS)
 
 
 def _strip_fences(text: str) -> str:
@@ -272,6 +311,7 @@ def _generate_markdown(
     *,
     on_wait: WaitCallback | None = None,
     should_abort: AbortCheck | None = None,
+    on_attempt: AttemptCallback | None = None,
     log_label: str,
     log_detail: object | None = None,
     session_id: str | None = None,
@@ -292,6 +332,8 @@ def _generate_markdown(
     for attempt in range(max_attempts):
         last_attempt = attempt + 1
         _raise_if_aborted(should_abort)
+        if on_attempt is not None:
+            on_attempt()
         try:
             devlog(
                 "Gemini %s model=%s attempt=%s/%s detail=%s",
@@ -428,6 +470,7 @@ def extract_libretto_markdown(
     session_id: str | None = None,
     source_name: str | None = None,
     batch_index: int | None = None,
+    on_attempt: AttemptCallback | None = None,
 ) -> str:
     """Envoie images + contexte depuis le dernier titre ; retourne la section mise à jour."""
     if not image_paths:
@@ -483,6 +526,7 @@ def extract_libretto_markdown(
         session_id=session_id,
         source_name=source_name,
         batch_index=batch_index,
+        on_attempt=on_attempt,
         images=len(image_paths),
         image_bytes=image_bytes,
         section_chars=len(ctx),
@@ -496,6 +540,7 @@ def review_libretto_markdown(
     should_abort: AbortCheck | None = None,
     session_id: str | None = None,
     source_name: str | None = None,
+    on_attempt: AttemptCallback | None = None,
 ) -> str:
     """Relecture finale du libretto complet (texte seul, sans images)."""
     text = markdown.strip()
@@ -518,5 +563,6 @@ def review_libretto_markdown(
         log_detail={"chars": len(text)},
         session_id=session_id,
         source_name=source_name,
+        on_attempt=on_attempt,
         section_chars=len(text),
     )

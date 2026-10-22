@@ -53,6 +53,9 @@ _HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
 _STAFF_MARKER_RE = re.compile(r"(?m)^---.+---\s*\n?")
 _worker_lock = threading.Lock()
 _running_sessions: set[str] = set()
+_active_workers: set[str] = set()
+_worker_generation: dict[str, int] = {}
+_active_generation: dict[str, int] = {}
 _queue_order: list[str] = []
 _cancel_lock = threading.Lock()
 _cancelled_sessions: set[str] = set()
@@ -61,6 +64,10 @@ _pace_lock = threading.Lock()
 _resume_lock = threading.Lock()
 _resume_last_at: dict[str, float] = {}
 _DAILY_WAIT_CHUNK_SECONDS = 30.0
+_SUSPEND_JUMP_SECONDS = 15.0
+_clock_sample_lock = threading.Lock()
+_last_wall_time: float | None = None
+_last_monotonic_time: float | None = None
 _supervisor_stop = threading.Event()
 _supervisor_thread: threading.Thread | None = None
 _supervisor_lock = threading.Lock()
@@ -350,17 +357,116 @@ def is_worker_alive(session_id: str) -> bool:
         return session_id in _running_sessions
 
 
+def _owns_worker(session_id: str, generation: int | None) -> bool:
+    if generation is None:
+        return True
+    with _worker_lock:
+        return _worker_generation.get(session_id) == generation
+
+
+def _updated_age_seconds(job: JobDict) -> float | None:
+    raw = job.get("updated_at")
+    if not isinstance(raw, str):
+        return None
+    updated = parse_wait_until(raw)
+    if updated is None:
+        return None
+    return (datetime.now(timezone.utc) - updated).total_seconds()
+
+
+def worker_is_stalled(job: JobDict) -> bool:
+    """Worker vivant mais sans progrès depuis plus que le timeout Gemini.
+
+    L'horloge murale avance pendant la veille, contrairement au thread bloqué
+    dans l'appel HTTP : au réveil le job est donc immédiatement en retard.
+    """
+    if job.get("status") != "running":
+        return False
+    raw_wait = job.get("wait")
+    if isinstance(raw_wait, dict) and raw_wait.get("reason"):
+        return False
+    session_id = str(job.get("session_id") or "")
+    if not session_id:
+        return False
+    with _worker_lock:
+        if session_id not in _active_workers:
+            return False
+    timeout = settings.gemini_request_timeout_seconds
+    if timeout <= 0:
+        return False
+    age = _updated_age_seconds(job)
+    if age is None:
+        return False
+    limit = timeout + max(settings.extract_stall_grace_seconds, 0.0)
+    return age > limit
+
+
 def job_is_stale(job: JobDict) -> bool:
     """
-    Worker absent alors que la session doit encore avancer :
-    running orphelin, ou pause daily sans thread d'attente (superviseur).
+    Worker absent ou bloqué alors que la session doit encore avancer :
+    running orphelin / stallé, ou pause daily sans thread d'attente.
     """
     session_id = str(job["session_id"])
-    if is_worker_alive(session_id):
+    if is_worker_alive(session_id) and not worker_is_stalled(job):
         return False
     if job.get("status") == "running":
         return True
     return _is_daily_resumable(job)
+
+
+def _touch_job(session_id: str) -> None:
+    if is_cancelled(session_id):
+        return
+    job = _load_job(session_id)
+    if job is None:
+        return
+    _save_job(job)
+
+
+def _blocked_in_gemini(job: JobDict) -> bool:
+    if job.get("status") != "running":
+        return False
+    raw_wait = job.get("wait")
+    if isinstance(raw_wait, dict) and raw_wait.get("reason"):
+        return False
+    session_id = str(job.get("session_id") or "")
+    if not session_id:
+        return False
+    with _worker_lock:
+        return session_id in _active_workers
+
+
+def consume_system_resume() -> bool:
+    """True une fois si l'horloge murale a sauté depuis le tick précédent."""
+    global _last_wall_time, _last_monotonic_time
+    wall = time.time()
+    mono = time.monotonic()
+    with _clock_sample_lock:
+        previous_wall = _last_wall_time
+        previous_mono = _last_monotonic_time
+        _last_wall_time = wall
+        _last_monotonic_time = mono
+    if previous_wall is None or previous_mono is None:
+        return False
+    wall_delta = wall - previous_wall
+    mono_delta = mono - previous_mono
+    return wall_delta > mono_delta + _SUSPEND_JUMP_SECONDS
+
+
+def abandon_stalled_worker(session_id: str) -> bool:
+    """Retire un worker bloqué pour qu'un nouveau puisse reprendre le job."""
+    with _worker_lock:
+        if session_id not in _active_workers:
+            return False
+        if _active_generation.get(session_id) != _worker_generation.get(session_id):
+            return False
+        _active_workers.discard(session_id)
+        _active_generation.pop(session_id, None)
+        _running_sessions.discard(session_id)
+        _worker_generation[session_id] = _worker_generation.get(session_id, 0) + 1
+    logger.warning("Extract stalled worker abandoned session=%s", session_id[:8])
+    gemini_client.close_client()
+    return True
 
 
 def assert_preconditions(
@@ -650,11 +756,18 @@ def _list_session_ids() -> list[str]:
 def reconcile_orphaned_jobs() -> int:
     """Parcourt les sessions et relance les workers absents quand c'est possible."""
     resumed = 0
+    woke = consume_system_resume()
     for session_id in _list_session_ids():
         job = _load_job(session_id)
         if job is None:
             continue
         job = _normalize_job(job)
+        if (woke and _blocked_in_gemini(job)) or worker_is_stalled(job):
+            _ = abandon_stalled_worker(session_id)
+            job = _load_job(session_id)
+            if job is None:
+                continue
+            job = _normalize_job(job)
         if not job_is_stale(job):
             continue
         if try_auto_resume(session_id):
@@ -1004,25 +1117,35 @@ def _spawn_worker(session_id: str) -> None:
     with _worker_lock:
         if session_id in _running_sessions:
             return
+        generation = _worker_generation.get(session_id, 0) + 1
+        _worker_generation[session_id] = generation
         _running_sessions.add(session_id)
 
     with _executor_lock:
         pool = _executor
     if pool is None:
         with _worker_lock:
-            _running_sessions.discard(session_id)
+            if _worker_generation.get(session_id) == generation:
+                _running_sessions.discard(session_id)
         return
     _ = _enter_worker_queue(session_id)
-    _ = pool.submit(_worker_entry, session_id)
+    _ = pool.submit(_worker_entry, session_id, generation)
 
 
-def _worker_entry(session_id: str) -> None:
+def _worker_entry(session_id: str, generation: int) -> None:
+    with _worker_lock:
+        _active_workers.add(session_id)
+        _active_generation[session_id] = generation
     try:
-        run_extraction(session_id)
+        run_extraction(session_id, generation)
     finally:
         _leave_worker_queue(session_id)
         with _worker_lock:
-            _running_sessions.discard(session_id)
+            if _active_generation.get(session_id) == generation:
+                _active_workers.discard(session_id)
+                _active_generation.pop(session_id, None)
+            if _worker_generation.get(session_id) == generation:
+                _running_sessions.discard(session_id)
 
 
 def _ensure_batch_rendered(session_id: str, end_page: int) -> None:
@@ -1076,13 +1199,23 @@ def _mark_review_done(session_id: str, job: JobDict) -> None:
 def _run_final_review(
     session_id: str,
     on_wait: Callable[[QuotaSignal | None], None],
+    worker_generation: int | None = None,
 ) -> bool:
     """
     Relecture Gemini après extraction des pages.
 
     True = terminé (ou libretto vide sauté) ; False = annulé / arrêté / erreur.
     """
+
+    def on_attempt() -> None:
+        if not _owns_worker(session_id, worker_generation):
+            return
+        _touch_job(session_id)
+
     while True:
+        if not _owns_worker(session_id, worker_generation):
+            logger.info("Extract worker superseded session=%s", session_id[:8])
+            return False
         if is_cancelled(session_id):
             logger.info("Extract cancelled session=%s", session_id[:8])
             return False
@@ -1139,10 +1272,17 @@ def _run_final_review(
             reviewed = gemini_client.review_libretto_markdown(
                 current,
                 on_wait=on_wait,
-                should_abort=lambda: is_cancelled(session_id),
+                should_abort=lambda: (
+                    is_cancelled(session_id)
+                    or not _owns_worker(session_id, worker_generation)
+                ),
+                on_attempt=on_attempt,
                 session_id=session_id,
                 source_name=str(job.get("source_name") or "") or None,
             )
+            if not _owns_worker(session_id, worker_generation):
+                logger.info("Extract worker superseded session=%s", session_id[:8])
+                return False
             if is_cancelled(session_id):
                 logger.info("Extract cancelled session=%s", session_id[:8])
                 return False
@@ -1152,10 +1292,15 @@ def _run_final_review(
             _mark_review_done(session_id, job)
             return True
         except GeminiCancelledError:
+            if not _owns_worker(session_id, worker_generation):
+                logger.info("Extract worker superseded session=%s", session_id[:8])
+                return False
             logger.info("Extract cancelled session=%s", session_id[:8])
             return False
         except GeminiDailyQuotaError as exc:
-            if is_cancelled(session_id):
+            if is_cancelled(session_id) or not _owns_worker(
+                session_id, worker_generation
+            ):
                 return False
             job = _load_job(session_id) or job
             if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
@@ -1170,7 +1315,9 @@ def _run_final_review(
                 return False
             continue
         except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
-            if is_cancelled(session_id):
+            if is_cancelled(session_id) or not _owns_worker(
+                session_id, worker_generation
+            ):
                 return False
             logger.exception(
                 "Review failed session=%s: %s: %s",
@@ -1187,9 +1334,9 @@ def _run_final_review(
             return False
 
 
-def run_extraction(session_id: str) -> None:
+def run_extraction(session_id: str, worker_generation: int | None = None) -> None:
     """Passe extract (lots) puis relecture Gemini finale."""
-    if is_cancelled(session_id):
+    if is_cancelled(session_id) or not _owns_worker(session_id, worker_generation):
         return
 
     job = _load_job(session_id)
@@ -1213,15 +1360,24 @@ def run_extraction(session_id: str) -> None:
     _save_job(job)
 
     def on_wait(signal: QuotaSignal | None) -> None:
-        if not is_cancelled(session_id):
-            _set_job_wait(session_id, signal)
+        if is_cancelled(session_id) or not _owns_worker(session_id, worker_generation):
+            return
+        _set_job_wait(session_id, signal)
+
+    def on_attempt() -> None:
+        if not _owns_worker(session_id, worker_generation):
+            return
+        _touch_job(session_id)
 
     try:
         if pages_done >= page_count and _review_pending(job):
-            _ = _run_final_review(session_id, on_wait)
+            _ = _run_final_review(session_id, on_wait, worker_generation)
             return
 
         while pages_done < page_count:
+            if not _owns_worker(session_id, worker_generation):
+                logger.info("Extract worker superseded session=%s", session_id[:8])
+                return
             if is_cancelled(session_id):
                 logger.info("Extract cancelled session=%s", session_id[:8])
                 return
@@ -1263,11 +1419,20 @@ def run_extraction(session_id: str) -> None:
                     image_paths,
                     section,
                     on_wait=on_wait,
-                    should_abort=lambda: is_cancelled(session_id),
+                    should_abort=lambda: (
+                        is_cancelled(session_id)
+                        or not _owns_worker(session_id, worker_generation)
+                    ),
+                    on_attempt=on_attempt,
                     session_id=session_id,
                     source_name=str(job.get("source_name") or "") or None,
                     batch_index=batch_index,
                 )
+                if not _owns_worker(session_id, worker_generation):
+                    logger.info(
+                        "Extract worker superseded session=%s", session_id[:8]
+                    )
+                    return
                 if is_cancelled(session_id):
                     logger.info("Extract cancelled session=%s", session_id[:8])
                     return
@@ -1285,10 +1450,17 @@ def run_extraction(session_id: str) -> None:
                 job["wait"] = None
                 _save_job(job)
             except GeminiCancelledError:
+                if not _owns_worker(session_id, worker_generation):
+                    logger.info(
+                        "Extract worker superseded session=%s", session_id[:8]
+                    )
+                    return
                 logger.info("Extract cancelled session=%s", session_id[:8])
                 return
             except GeminiDailyQuotaError as exc:
-                if is_cancelled(session_id):
+                if is_cancelled(session_id) or not _owns_worker(
+                    session_id, worker_generation
+                ):
                     return
                 job = _load_job(session_id) or job
                 if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
@@ -1309,13 +1481,16 @@ def run_extraction(session_id: str) -> None:
                 _save_job(job)
                 continue
 
-        if is_cancelled(session_id):
+        if is_cancelled(session_id) or not _owns_worker(session_id, worker_generation):
             return
-        _ = _run_final_review(session_id, on_wait)
+        _ = _run_final_review(session_id, on_wait, worker_generation)
     except GeminiCancelledError:
+        if not _owns_worker(session_id, worker_generation):
+            logger.info("Extract worker superseded session=%s", session_id[:8])
+            return
         logger.info("Extract cancelled session=%s", session_id[:8])
     except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
-        if is_cancelled(session_id):
+        if is_cancelled(session_id) or not _owns_worker(session_id, worker_generation):
             return
         logger.exception(
             "Extract failed session=%s: %s: %s",
