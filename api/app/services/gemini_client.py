@@ -11,6 +11,7 @@ from google.genai import types
 
 from app.config import settings
 from app.devlog import devlog
+from app.services import gemini_token_usage
 from app.services.gemini_errors import (
     GeminiCancelledError,
     GeminiDailyQuotaError,
@@ -131,6 +132,85 @@ def _interruptible_sleep(
         time.sleep(min(remaining, 0.5))
 
 
+def _modality_details(raw: object | None) -> list[dict[str, object]] | None:
+    if not raw:
+        return None
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, object]] = []
+    for item in raw:
+        modality = getattr(item, "modality", None)
+        token_count = getattr(item, "token_count", None)
+        if modality is None and token_count is None:
+            continue
+        entry: dict[str, object] = {}
+        if modality is not None:
+            entry["modality"] = getattr(modality, "value", None) or str(modality)
+        if token_count is not None:
+            entry["token_count"] = int(token_count)
+        out.append(entry)
+    return out or None
+
+
+def _usage_to_dict(metadata: object | None) -> dict[str, object]:
+    if metadata is None:
+        return {}
+    fields: dict[str, object] = {}
+    for key in (
+        "prompt_token_count",
+        "candidates_token_count",
+        "thoughts_token_count",
+        "cached_content_token_count",
+        "tool_use_prompt_token_count",
+        "total_token_count",
+    ):
+        value = getattr(metadata, key, None)
+        if value is not None:
+            fields[key] = int(value)
+    details = _modality_details(getattr(metadata, "prompt_tokens_details", None))
+    if details is not None:
+        fields["prompt_tokens_details"] = details
+    return fields
+
+
+def _record_usage(
+    *,
+    kind: str,
+    attempt: int,
+    ok: bool,
+    session_id: str | None = None,
+    source_name: str | None = None,
+    batch_index: int | None = None,
+    images: int | None = None,
+    image_bytes: int | None = None,
+    section_chars: int | None = None,
+    usage_metadata: object | None = None,
+    error_type: str | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "kind": kind,
+        "model": settings.gemini_model,
+        "attempt": attempt,
+        "ok": ok,
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if source_name is not None:
+        payload["source_name"] = source_name
+    if batch_index is not None:
+        payload["batch_index"] = batch_index
+    if images is not None:
+        payload["images"] = images
+    if image_bytes is not None:
+        payload["image_bytes"] = image_bytes
+    if section_chars is not None:
+        payload["section_chars"] = section_chars
+    if error_type is not None:
+        payload["error_type"] = error_type
+    payload.update(_usage_to_dict(usage_metadata))
+    gemini_token_usage.record_call(payload)
+
+
 def _handle_quota_and_maybe_wait(
     exc: BaseException,
     *,
@@ -194,15 +274,23 @@ def _generate_markdown(
     should_abort: AbortCheck | None = None,
     log_label: str,
     log_detail: object | None = None,
+    session_id: str | None = None,
+    source_name: str | None = None,
+    batch_index: int | None = None,
+    images: int | None = None,
+    image_bytes: int | None = None,
+    section_chars: int | None = None,
 ) -> str:
     config = types.GenerateContentConfig(
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
     last_error: BaseException | None = None
+    last_attempt = 0
     max_attempts = max(settings.extract_max_retries + 1, 6)
 
     for attempt in range(max_attempts):
+        last_attempt = attempt + 1
         _raise_if_aborted(should_abort)
         try:
             devlog(
@@ -222,6 +310,18 @@ def _generate_markdown(
             if not text:
                 raise ValueError("Réponse Gemini vide")
             _raise_if_aborted(should_abort)
+            _record_usage(
+                kind=log_label,
+                attempt=attempt + 1,
+                ok=True,
+                session_id=session_id,
+                source_name=source_name,
+                batch_index=batch_index,
+                images=images,
+                image_bytes=image_bytes,
+                section_chars=section_chars,
+                usage_metadata=getattr(response, "usage_metadata", None),
+            )
             devlog(
                 "Gemini %s response model=%s attempt=%s chars=%s",
                 log_label,
@@ -234,7 +334,19 @@ def _generate_markdown(
             return text
         except GeminiCancelledError:
             raise
-        except GeminiDailyQuotaError:
+        except GeminiDailyQuotaError as exc:
+            _record_usage(
+                kind=log_label,
+                attempt=attempt + 1,
+                ok=False,
+                session_id=session_id,
+                source_name=source_name,
+                batch_index=batch_index,
+                images=images,
+                image_bytes=image_bytes,
+                section_chars=section_chars,
+                error_type=type(exc).__name__,
+            )
             if on_wait is not None:
                 on_wait(
                     QuotaSignal(
@@ -256,7 +368,19 @@ def _generate_markdown(
                     continue
             except GeminiCancelledError:
                 raise
-            except GeminiDailyQuotaError:
+            except GeminiDailyQuotaError as daily_exc:
+                _record_usage(
+                    kind=log_label,
+                    attempt=attempt + 1,
+                    ok=False,
+                    session_id=session_id,
+                    source_name=source_name,
+                    batch_index=batch_index,
+                    images=images,
+                    image_bytes=image_bytes,
+                    section_chars=section_chars,
+                    error_type=type(daily_exc).__name__,
+                )
                 if on_wait is not None:
                     on_wait(
                         QuotaSignal(
@@ -280,6 +404,18 @@ def _generate_markdown(
             _interruptible_sleep(delay, should_abort)
 
     assert last_error is not None
+    _record_usage(
+        kind=log_label,
+        attempt=last_attempt,
+        ok=False,
+        session_id=session_id,
+        source_name=source_name,
+        batch_index=batch_index,
+        images=images,
+        image_bytes=image_bytes,
+        section_chars=section_chars,
+        error_type=type(last_error).__name__,
+    )
     raise last_error
 
 
@@ -289,6 +425,9 @@ def extract_libretto_markdown(
     *,
     on_wait: WaitCallback | None = None,
     should_abort: AbortCheck | None = None,
+    session_id: str | None = None,
+    source_name: str | None = None,
+    batch_index: int | None = None,
 ) -> str:
     """Envoie images + contexte depuis le dernier titre ; retourne la section mise à jour."""
     if not image_paths:
@@ -321,9 +460,11 @@ def extract_libretto_markdown(
             text=f"Voici {len(image_paths)} page(s) de partition à lire :"
         )
     )
+    image_bytes = 0
     for index, path in enumerate(image_paths, start=1):
         _raise_if_aborted(should_abort)
         data = path.read_bytes()
+        image_bytes += len(data)
         parts.append(types.Part.from_text(text=f"Image {index} :"))
         parts.append(types.Part.from_bytes(data=data, mime_type="image/png"))
 
@@ -339,6 +480,12 @@ def extract_libretto_markdown(
         should_abort=should_abort,
         log_label="extract",
         log_detail={"images": image_labels, "section_chars": len(ctx)},
+        session_id=session_id,
+        source_name=source_name,
+        batch_index=batch_index,
+        images=len(image_paths),
+        image_bytes=image_bytes,
+        section_chars=len(ctx),
     )
 
 
@@ -347,6 +494,8 @@ def review_libretto_markdown(
     *,
     on_wait: WaitCallback | None = None,
     should_abort: AbortCheck | None = None,
+    session_id: str | None = None,
+    source_name: str | None = None,
 ) -> str:
     """Relecture finale du libretto complet (texte seul, sans images)."""
     text = markdown.strip()
@@ -367,4 +516,7 @@ def review_libretto_markdown(
         should_abort=should_abort,
         log_label="review",
         log_detail={"chars": len(text)},
+        session_id=session_id,
+        source_name=source_name,
+        section_chars=len(text),
     )

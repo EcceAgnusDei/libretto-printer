@@ -1140,6 +1140,8 @@ def _run_final_review(
                 current,
                 on_wait=on_wait,
                 should_abort=lambda: is_cancelled(session_id),
+                session_id=session_id,
+                source_name=str(job.get("source_name") or "") or None,
             )
             if is_cancelled(session_id):
                 logger.info("Extract cancelled session=%s", session_id[:8])
@@ -1262,6 +1264,9 @@ def run_extraction(session_id: str) -> None:
                     section,
                     on_wait=on_wait,
                     should_abort=lambda: is_cancelled(session_id),
+                    session_id=session_id,
+                    source_name=str(job.get("source_name") or "") or None,
+                    batch_index=batch_index,
                 )
                 if is_cancelled(session_id):
                     logger.info("Extract cancelled session=%s", session_id[:8])
