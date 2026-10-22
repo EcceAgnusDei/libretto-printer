@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -147,6 +148,10 @@ def _libretto_path(session_id: str) -> Path:
     return settings.sessions_dir / session_id / "libretto.md"
 
 
+def _batches_dir(session_id: str) -> Path:
+    return settings.sessions_dir / session_id / "batches"
+
+
 def _page_png_path(session_id: str, page_index: int) -> Path:
     return (
         settings.sessions_dir
@@ -154,6 +159,33 @@ def _page_png_path(session_id: str, page_index: int) -> Path:
         / "pages"
         / f"page_{page_index:04d}.png"
     )
+
+
+def clear_batch_responses(session_id: str) -> None:
+    directory = _batches_dir(session_id)
+    if not directory.is_dir():
+        return
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning(
+                "Could not remove batch response session=%s file=%s",
+                session_id[:8],
+                path.name,
+            )
+
+
+def write_batch_response(
+    session_id: str, batch_index: int, content: str
+) -> None:
+    directory = _batches_dir(session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    text = content if content.endswith("\n") else f"{content}\n"
+    path = directory / f"batch_{batch_index:04d}.md"
+    _ = path.write_text(text, encoding="utf-8")
 
 
 def _now_iso() -> str:
@@ -323,6 +355,21 @@ def split_current_section(markdown: str) -> tuple[str, str]:
     return markdown[:idx], markdown[idx:]
 
 
+def _first_heading_line(markdown: str) -> str | None:
+    for line in markdown.splitlines():
+        if _HEADING_RE.match(line):
+            return line.strip()
+    return None
+
+
+def _normalize_heading(line: str) -> str:
+    text = re.sub(r"^#{1,3}\s*", "", line.strip())
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.casefold()
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def read_libretto(session_id: str) -> str:
     path = _libretto_path(session_id)
     if not path.exists():
@@ -338,10 +385,30 @@ def write_libretto(session_id: str, content: str) -> None:
 
 
 def apply_section_update(markdown: str, updated_section: str) -> str:
-    prefix, _section = split_current_section(markdown)
+    prefix, section = split_current_section(markdown)
     updated = updated_section.strip()
     if not updated:
         return markdown
+
+    section_heading = _first_heading_line(section)
+    updated_heading = _first_heading_line(updated)
+    opens_new_section = (
+        bool(section.strip())
+        and section_heading is not None
+        and updated_heading is not None
+        and _normalize_heading(section_heading)
+        != _normalize_heading(updated_heading)
+    )
+    if opens_new_section:
+        frozen = strip_staff_markers(section)
+        parts: list[str] = []
+        if prefix.strip():
+            parts.append(prefix.strip())
+        if frozen:
+            parts.append(frozen)
+        parts.append(updated)
+        return "\n\n".join(parts) + "\n"
+
     if prefix and not prefix.endswith("\n"):
         prefix += "\n"
     return f"{prefix}{updated}\n"
@@ -532,6 +599,7 @@ def start_job(session_id: str) -> JobDict:
     now = _now_iso()
 
     write_libretto(session_id, "")
+    clear_batch_responses(session_id)
     from app.services import export_pdf as export_pdf_service
 
     export_pdf_service.clear_libretto_pdf(session_id)
@@ -792,6 +860,14 @@ def _session_last_activity_ts(session_id: str) -> float:
             newest = max(newest, path.stat().st_mtime)
         except OSError:
             continue
+    batches = base / "batches"
+    if batches.is_dir():
+        try:
+            for path in batches.iterdir():
+                if path.is_file():
+                    newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
     return newest
 
 
@@ -1437,6 +1513,7 @@ def run_extraction(session_id: str, worker_generation: int | None = None) -> Non
                     logger.info("Extract cancelled session=%s", session_id[:8])
                     return
                 usage_quota.record_batch()
+                write_batch_response(session_id, batch_index, updated_section)
                 new_md = apply_section_update(current, updated_section)
                 write_libretto(session_id, new_md)
 

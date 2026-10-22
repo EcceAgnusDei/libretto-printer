@@ -94,6 +94,44 @@ class ApplySectionUpdateTests(unittest.TestCase):
         current = "## Acte I\n\nTexte.\n"
         self.assertEqual(apply_section_update(current, "  "), current)
 
+    def test_new_heading_locks_previous_section(self) -> None:
+        current = (
+            "## Acte II\n\n"
+            "### Scène 5\n\n"
+            "Avant.\n\n"
+            "### Scène 6\n\n"
+            "*Zélidie, Zaïs.*\n\n"
+            "**Zélidie.**\n"
+            "Ciel est ce vous ! en croirai-je mes yeux ?\n\n"
+            "**Zaïs.**\n"
+            "Moi, vous fuir ! quel ordre funeste !\n\n"
+            "---Zélidie---\n"
+            "---(aucun)---\n"
+        )
+        updated = (
+            "## Acte III\n\n"
+            "### Scène 1\n\n"
+            "**Cindor.**\n"
+            "Vous estes obéï.\n"
+        )
+        result = apply_section_update(current, updated)
+        self.assertIn("en croirai-je mes yeux", result)
+        self.assertIn("Moi, vous fuir", result)
+        self.assertIn("## Acte III", result)
+        self.assertIn("Vous estes obéï", result)
+        self.assertNotIn("---Zélidie---", result)
+        prefix, section = split_current_section(result)
+        self.assertIn("### Scène 6", prefix)
+        self.assertIn("en croirai-je mes yeux", prefix)
+        self.assertTrue(section.startswith("### Scène 1"))
+
+    def test_same_heading_still_replaces(self) -> None:
+        current = "### Scène 6\n\nAncien début.\n\n---Zaïs---\n"
+        updated = "### Scène 6\n\nSuite complète.\n\n---Zaïs---\n"
+        result = apply_section_update(current, updated)
+        self.assertIn("Suite complète", result)
+        self.assertNotIn("Ancien début", result)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

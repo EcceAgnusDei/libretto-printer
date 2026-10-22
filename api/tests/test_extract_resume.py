@@ -970,6 +970,46 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertIn("Texte partiel", md)
         self.assertIn("Page 2", md)
 
+    def test_batch_responses_saved_and_cleared_on_restart(self) -> None:
+        session_id = self._make_session(4)
+        self._write_partial_job(session_id, pages_done=4, status="done")
+        batches_dir = settings.sessions_dir / session_id / "batches"
+        batches_dir.mkdir(parents=True, exist_ok=True)
+        stale = batches_dir / "batch_0001.md"
+        stale.write_text("ancien\n", encoding="utf-8")
+
+        def fake_extract(image_paths, section, *, on_wait=None, should_abort=None, **_kwargs):
+            start = int(image_paths[0].stem.split("_")[1])
+            return f"## Lot {start}\n\nTexte {start}.\n"
+
+        with (
+            patch.object(extract_service, "_spawn_worker"),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service.start_job(session_id)
+            self.assertFalse(stale.exists())
+            extract_service.run_extraction(session_id)
+
+        files = sorted(batches_dir.glob("batch_*.md"))
+        self.assertEqual(
+            [path.name for path in files],
+            ["batch_0001.md", "batch_0002.md"],
+        )
+        self.assertEqual(
+            files[0].read_text(encoding="utf-8"),
+            "## Lot 0\n\nTexte 0.\n",
+        )
+        self.assertEqual(
+            files[1].read_text(encoding="utf-8"),
+            "## Lot 2\n\nTexte 2.\n",
+        )
+
     def test_is_daily_resumable_helpers(self) -> None:
         self.assertTrue(
             extract_service._is_daily_resumable(
