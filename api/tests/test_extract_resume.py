@@ -93,12 +93,21 @@ class ExtractResumeTests(unittest.TestCase):
             side_effect=lambda markdown, **_kwargs: markdown,
         )
         self._review_patcher.start()
+        self._piece_info_patcher = patch.object(
+            gemini_client,
+            "extract_piece_info",
+            return_value="",
+        )
+        self._piece_info_patcher.start()
 
     @override
     def tearDown(self) -> None:
         patcher = getattr(self, "_review_patcher", None)
         if patcher is not None:
             patcher.stop()
+        piece_info_patcher = getattr(self, "_piece_info_patcher", None)
+        if piece_info_patcher is not None:
+            piece_info_patcher.stop()
         extract_service.stop_worker_pool()
         extract_service._running_sessions.clear()
         extract_service._active_workers.clear()
@@ -790,6 +799,7 @@ class ExtractResumeTests(unittest.TestCase):
         job["wait"] = None
         job["error"] = None
         job["review_done"] = True
+        job["pdf_ready"] = True
         extract_service._save_job(job)
 
         with self.assertRaises(HTTPException) as ctx:
@@ -1713,7 +1723,7 @@ class ExtractResumeTests(unittest.TestCase):
             extract_service.run_extraction(session_id)
 
         self.assertEqual(len(review_calls), 1)
-        self.assertEqual(record.call_count, 2)
+        self.assertEqual(record.call_count, 3)
         job = extract_service._load_job(session_id)
         assert job is not None
         self.assertEqual(job["status"], "done")
@@ -1956,6 +1966,295 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertIsNone(job["error"])
         self.assertEqual(job["pages_done"], 2)
         self.assertIn("Texte", extract_service.read_libretto(session_id))
+
+    def _save_running_extract_job(
+        self,
+        session_id: str,
+        *,
+        page_count: int,
+        batch_size: int,
+        pages_done: int = 0,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        extract_service._save_job(
+            {
+                "session_id": session_id,
+                "status": "running",
+                "phase": "extract",
+                "source_name": "fixture.pdf",
+                "pdf_page_count": page_count,
+                "batch_size": batch_size,
+                "total_batches": extract_service._total_batches(page_count, batch_size),
+                "pages_done": pages_done,
+                "current_batch": 0,
+                "review_done": False,
+                "piece_info_done": False,
+                "error": None,
+                "wait": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+    def test_piece_info_uses_five_pages_independent_of_batch_size(self) -> None:
+        session_id = self._make_session(8)
+        extract_service.write_libretto(session_id, "")
+        self._save_running_extract_job(session_id, page_count=8, batch_size=2)
+        seen_pages: list[list[str]] = []
+        dialogue_starts: list[int] = []
+        sections: list[str] = []
+
+        def fake_info(image_paths: list[Path], **_kwargs: object) -> str:
+            seen_pages.append([path.name for path in image_paths])
+            return "# Carmen\n\nCompositeur : Bizet\n---Carmen---\n"
+
+        def fake_extract(
+            image_paths: list[Path],
+            section: str,
+            **_kwargs: object,
+        ) -> str:
+            dialogue_starts.append(int(image_paths[0].stem.split("_")[1]))
+            sections.append(section)
+            raise GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server")
+
+        with (
+            patch.object(gemini_client, "extract_piece_info", side_effect=fake_info),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch") as record,
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=False,
+            ),
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertEqual(
+            seen_pages,
+            [[f"page_{index:04d}.png" for index in range(5)]],
+        )
+        self.assertEqual(dialogue_starts, [0])
+        self.assertTrue(sections)
+        self.assertNotIn("Carmen", sections[0])
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["pages_done"], 0)
+        self.assertTrue(job["piece_info_done"])
+        self.assertEqual(job["status"], "paused")
+        stored = extract_service.read_piece_info(session_id)
+        self.assertIn("Carmen", stored)
+        self.assertIn("Compositeur : Bizet", stored)
+        self.assertNotIn("---", stored)
+        self.assertEqual(record.call_count, 1)
+        public = extract_service.get_libretto(session_id)
+        self.assertIn("Carmen", public)
+
+    def test_piece_info_page_count_is_capped_by_pdf_length(self) -> None:
+        session_id = self._make_session(3)
+        extract_service.write_libretto(session_id, "")
+        self._save_running_extract_job(session_id, page_count=3, batch_size=2)
+        seen: list[int] = []
+
+        def fake_info(image_paths: list[Path], **_kwargs: object) -> str:
+            seen.append(len(image_paths))
+            return "# Court\n"
+
+        with (
+            patch.object(gemini_client, "extract_piece_info", side_effect=fake_info),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server"),
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=False,
+            ),
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertEqual(seen, [3])
+
+    def test_piece_info_failure_does_not_record_quota(self) -> None:
+        session_id = self._make_session(2)
+        extract_service.write_libretto(session_id, "")
+        self._save_running_extract_job(session_id, page_count=2, batch_size=2)
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_piece_info",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch") as record,
+        ):
+            extract_service.run_extraction(session_id)
+
+        record.assert_not_called()
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["status"], "error")
+        self.assertEqual(job["error"], MSG_EXTRACT_FAILED)
+        self.assertNotEqual(job.get("piece_info_done"), True)
+        self.assertEqual(job["pages_done"], 0)
+
+    def test_piece_info_is_not_requested_again_when_already_stored(self) -> None:
+        session_id = self._make_session(2)
+        extract_service.write_libretto(session_id, "")
+        extract_service.write_piece_info(
+            session_id,
+            "# Carmen\n\nCompositeur : Bizet\n",
+        )
+        self._save_running_extract_job(session_id, page_count=2, batch_size=2)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["piece_info_done"] = True
+        extract_service._save_job(job)
+        calls = {"n": 0}
+
+        def fake_info(*_args: object, **_kwargs: object) -> str:
+            calls["n"] += 1
+            return "# Autre\n"
+
+        with (
+            patch.object(gemini_client, "extract_piece_info", side_effect=fake_info),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                return_value="## Acte I\n\n**José.** Ah.\n",
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertEqual(calls["n"], 0)
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertTrue(job["piece_info_done"])
+        self.assertEqual(job["status"], "done")
+
+    def test_review_receives_piece_info_then_dialogues(self) -> None:
+        session_id = self._make_session(2)
+        extract_service.write_libretto(session_id, "")
+        self._save_running_extract_job(session_id, page_count=2, batch_size=2)
+        sections: list[str] = []
+        review_inputs: list[str] = []
+
+        def fake_extract(
+            _image_paths: list[Path],
+            section: str,
+            **_kwargs: object,
+        ) -> str:
+            sections.append(section)
+            return "## Acte I\n\n**José.** Ah.\n"
+
+        def fake_review(markdown: str, **_kwargs: object) -> str:
+            review_inputs.append(markdown)
+            return (
+                "# Carmen\n\nCompositeur : Bizet\n\n"
+                "## Acte I\n\n**José.** Ah !\n"
+            )
+
+        with (
+            patch.object(
+                gemini_client,
+                "extract_piece_info",
+                return_value="# Carmen\n\nCompositeur : Bizet\n",
+            ),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=fake_extract,
+            ),
+            patch.object(
+                gemini_client,
+                "review_libretto_markdown",
+                side_effect=fake_review,
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+        ):
+            extract_service.run_extraction(session_id)
+
+        self.assertTrue(sections)
+        self.assertNotIn("Carmen", sections[0])
+        self.assertEqual(len(review_inputs), 1)
+        reviewed = review_inputs[0]
+        self.assertIn("Carmen", reviewed)
+        self.assertIn("**José.** Ah.", reviewed)
+        self.assertLess(reviewed.index("Carmen"), reviewed.index("**José.**"))
+        public = extract_service.get_libretto(session_id)
+        self.assertEqual(public.count("Carmen"), 1)
+        self.assertIn("Ah !", public)
+        self.assertEqual(extract_service.read_piece_info(session_id), "")
+
+    def test_piece_info_is_capped(self) -> None:
+        session_id = self._make_session(2)
+        extract_service.write_libretto(session_id, "")
+        self._save_running_extract_job(session_id, page_count=2, batch_size=2)
+        huge = "# Carmen\n" + ("A" * (extract_service.PIECE_INFO_MAX_CHARS + 500))
+
+        with (
+            patch.object(gemini_client, "extract_piece_info", return_value=huge),
+            patch.object(
+                gemini_client,
+                "extract_libretto_markdown",
+                side_effect=GeminiDailyQuotaError(MSG_DAILY_QUOTA, source="server"),
+            ),
+            patch.object(usage_quota, "assert_under_daily_limit"),
+            patch.object(usage_quota, "record_batch"),
+            patch.object(
+                extract_service,
+                "_await_daily_quota_reset",
+                return_value=False,
+            ),
+        ):
+            extract_service.run_extraction(session_id)
+
+        stored = extract_service.read_piece_info(session_id).strip()
+        self.assertLessEqual(len(stored), extract_service.PIECE_INFO_MAX_CHARS)
+        self.assertTrue(stored.startswith("# Carmen"))
+
+    def test_start_job_clears_previous_piece_info(self) -> None:
+        session_id = self._make_session(2)
+        extract_service.write_piece_info(session_id, "# Ancien\n")
+        with patch.object(extract_service, "_spawn_worker"):
+            job = extract_service.start_job(session_id)
+        self.assertEqual(extract_service.read_piece_info(session_id), "")
+        self.assertFalse(job.get("piece_info_done"))
+
+    def test_get_libretto_prefixes_piece_info_until_review(self) -> None:
+        session_id = self._make_session(2)
+        self._save_running_extract_job(session_id, page_count=2, batch_size=2)
+        extract_service.write_piece_info(
+            session_id,
+            "# Carmen\n\nCompositeur : Bizet\n",
+        )
+        extract_service.write_libretto(session_id, "## Acte I\n\n**José.** Ah.\n")
+        public = extract_service.get_libretto(session_id)
+        self.assertLess(public.index("Carmen"), public.index("**José.**"))
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        job["review_done"] = True
+        job["status"] = "done"
+        extract_service._save_job(job)
+        extract_service.write_libretto(
+            session_id,
+            "# Carmen\n\n## Acte I\n\nrevu\n",
+        )
+        reviewed = extract_service.get_libretto(session_id)
+        self.assertEqual(reviewed.count("Carmen"), 1)
+        self.assertIn("revu", reviewed)
 
     def test_strip_staff_markers(self) -> None:
         raw = "# Titre\n\n**A.** hi\n---A---\n---(aucun)---\n\n**B.** yo\n"

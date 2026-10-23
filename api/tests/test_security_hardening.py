@@ -194,6 +194,10 @@ class ExtractErrorRedactionTests(unittest.TestCase):
 
         with (
             patch(
+                "app.services.extract.gemini_client.extract_piece_info",
+                return_value="",
+            ),
+            patch(
                 "app.services.extract.gemini_client.extract_libretto_markdown",
                 return_value="# Titre\n\nTexte.\n",
             ),
@@ -207,7 +211,7 @@ class ExtractErrorRedactionTests(unittest.TestCase):
             extract_service.run_extraction(session_id)
 
         assert_limit.assert_called()
-        self.assertEqual(record.call_count, 2)
+        self.assertEqual(record.call_count, 3)
         job = extract_service._load_job(session_id)
         assert job is not None
         self.assertEqual(job["status"], "done")
@@ -235,6 +239,10 @@ class ExtractErrorRedactionTests(unittest.TestCase):
         )
 
         with (
+            patch(
+                "app.services.extract.gemini_client.extract_piece_info",
+                side_effect=RuntimeError("boom"),
+            ),
             patch(
                 "app.services.extract.gemini_client.extract_libretto_markdown",
                 side_effect=RuntimeError("boom"),

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     extract_stall_grace_seconds: float = 60.0
     gemini_quota_timezone: str = "America/Los_Angeles"
     gemini_max_batches_per_day: int = Field(
-        default=100,
+        default=300,
         validation_alias=AliasChoices(
             "GEMINI_MAX_BATCHES_PER_DAY",
             "gemini_max_batches_per_day",

@@ -50,6 +50,8 @@ _VALID_STATUSES = frozenset({"running", "paused", "done", "error"})
 _PHASE_EXTRACT = "extract"
 _PHASE_REVIEW = "review"
 _VALID_PHASES = frozenset({_PHASE_EXTRACT, _PHASE_REVIEW})
+PIECE_INFO_PAGES = 5
+PIECE_INFO_MAX_CHARS = 12_000
 _HEADING_RE = re.compile(r"(?m)^#{1,3}[ \t]")
 _STAFF_MARKER_RE = re.compile(r"(?m)^---.+---\s*\n?")
 _worker_lock = threading.Lock()
@@ -146,6 +148,10 @@ def _job_path(session_id: str) -> Path:
 
 def _libretto_path(session_id: str) -> Path:
     return settings.sessions_dir / session_id / "libretto.md"
+
+
+def _piece_info_path(session_id: str) -> Path:
+    return settings.sessions_dir / session_id / "piece_info.md"
 
 
 def _batches_dir(session_id: str) -> Path:
@@ -384,6 +390,39 @@ def write_libretto(session_id: str, content: str) -> None:
     _ = _libretto_path(session_id).write_text(text, encoding="utf-8")
 
 
+def read_piece_info(session_id: str) -> str:
+    path = _piece_info_path(session_id)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def write_piece_info(session_id: str, content: str) -> None:
+    text = content.strip()
+    if text:
+        text += "\n"
+    _ = _piece_info_path(session_id).write_text(text, encoding="utf-8")
+
+
+def assemble_libretto(piece_info: str, dialogues: str) -> str:
+    info = piece_info.strip()
+    body = dialogues.strip()
+    if info and body:
+        return f"{info}\n\n{body}\n"
+    if info:
+        return f"{info}\n"
+    if body:
+        return f"{body}\n"
+    return ""
+
+
+def _limit_piece_info(text: str) -> str:
+    cleaned = strip_staff_markers(text).strip()
+    if len(cleaned) <= PIECE_INFO_MAX_CHARS:
+        return cleaned
+    return cleaned[:PIECE_INFO_MAX_CHARS].rstrip()
+
+
 def apply_section_update(markdown: str, updated_section: str) -> str:
     prefix, section = split_current_section(markdown)
     updated = updated_section.strip()
@@ -599,6 +638,7 @@ def start_job(session_id: str) -> JobDict:
     now = _now_iso()
 
     write_libretto(session_id, "")
+    write_piece_info(session_id, "")
     clear_batch_responses(session_id)
     from app.services import export_pdf as export_pdf_service
 
@@ -615,6 +655,7 @@ def start_job(session_id: str) -> JobDict:
         "pages_done": 0,
         "current_batch": 0,
         "review_done": False,
+        "piece_info_done": False,
         "pdf_ready": False,
         "error": None,
         "wait": None,
@@ -1178,12 +1219,15 @@ def get_job(session_id: str) -> JobDict:
 def get_libretto(session_id: str) -> str:
     _ = ingest_service.assert_safe_session_id(session_id)
     _ = ingest_service.get_session(session_id)
-    if _load_job(session_id) is None:
+    job = _load_job(session_id)
+    if job is None:
         raise HTTPException(
             status_code=404,
             detail="Aucune extraction démarrée pour cette session",
         )
-    return read_libretto(session_id)
+    if job.get("review_done") is True:
+        return read_libretto(session_id)
+    return assemble_libretto(read_piece_info(session_id), read_libretto(session_id))
 
 
 def _spawn_worker(session_id: str) -> None:
@@ -1326,7 +1370,10 @@ def _run_final_review(
         job["wait"] = None
         _save_job(job)
 
-        current = read_libretto(session_id)
+        current = assemble_libretto(
+            read_piece_info(session_id),
+            read_libretto(session_id),
+        )
         if not current.strip():
             _mark_review_done(session_id, job)
             return True
@@ -1364,6 +1411,7 @@ def _run_final_review(
                 return False
             usage_quota.record_batch()
             write_libretto(session_id, strip_staff_markers(reviewed))
+            write_piece_info(session_id, "")
             job = _load_job(session_id) or job
             _mark_review_done(session_id, job)
             return True
@@ -1410,8 +1458,142 @@ def _run_final_review(
             return False
 
 
+def _run_piece_info(
+    session_id: str,
+    job: JobDict,
+    on_wait: Callable[[QuotaSignal | None], None],
+    worker_generation: int | None,
+) -> bool:
+    """True si les infos de la pièce sont enregistrées. False si arrêt."""
+    if job.get("piece_info_done") is True:
+        return True
+    existing = read_piece_info(session_id).strip()
+    if existing:
+        job["piece_info_done"] = True
+        job["error"] = None
+        job["wait"] = None
+        _save_job(job)
+        return True
+
+    page_count = _as_int(job.get("pdf_page_count"))
+    page_total = min(PIECE_INFO_PAGES, page_count)
+    if page_total < 1:
+        job["piece_info_done"] = True
+        _save_job(job)
+        return True
+
+    def on_attempt() -> None:
+        if not _owns_worker(session_id, worker_generation):
+            return
+        _touch_job(session_id)
+
+    while True:
+        if not _owns_worker(session_id, worker_generation):
+            logger.info("Extract worker superseded session=%s", session_id[:8])
+            return False
+        if is_cancelled(session_id):
+            logger.info("Extract cancelled session=%s", session_id[:8])
+            return False
+        try:
+            _ensure_batch_rendered(session_id, page_total)
+            page_indices = list(range(page_total))
+            image_paths = [_page_png_path(session_id, i) for i in page_indices]
+            missing = [str(p) for p in image_paths if not p.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    f"Pages PNG manquantes pour les infos de la pièce: {missing[:3]}"
+                )
+            logger.info(
+                "Piece info session=%s pages=1-%s",
+                session_id[:8],
+                page_total,
+            )
+            _pace_before_gemini(session_id)
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            usage_quota.assert_under_daily_limit()
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            text = gemini_client.extract_piece_info(
+                image_paths,
+                on_wait=on_wait,
+                should_abort=lambda: (
+                    is_cancelled(session_id)
+                    or not _owns_worker(session_id, worker_generation)
+                ),
+                on_attempt=on_attempt,
+                session_id=session_id,
+                source_name=str(job.get("source_name") or "") or None,
+            )
+            if not _owns_worker(session_id, worker_generation):
+                logger.info("Extract worker superseded session=%s", session_id[:8])
+                return False
+            if is_cancelled(session_id):
+                logger.info("Extract cancelled session=%s", session_id[:8])
+                return False
+            usage_quota.record_batch()
+            write_piece_info(session_id, _limit_piece_info(text))
+            fresh = _load_job(session_id) or job
+            fresh["status"] = "running"
+            fresh["phase"] = _PHASE_EXTRACT
+            fresh["piece_info_done"] = True
+            fresh["error"] = None
+            fresh["wait"] = None
+            _save_job(fresh)
+            return True
+        except GeminiCancelledError:
+            if not _owns_worker(session_id, worker_generation):
+                logger.info("Extract worker superseded session=%s", session_id[:8])
+                return False
+            logger.info("Extract cancelled session=%s", session_id[:8])
+            return False
+        except GeminiDailyQuotaError as exc:
+            if is_cancelled(session_id) or not _owns_worker(
+                session_id, worker_generation
+            ):
+                return False
+            job = _load_job(session_id) or job
+            if getattr(exc, "user_message", str(exc)) == MSG_QUOTA_MISCONFIGURED:
+                job["status"] = "error"
+                job["phase"] = _PHASE_EXTRACT
+                job["error"] = MSG_QUOTA_MISCONFIGURED
+                job["wait"] = None
+                _save_job(job)
+                return False
+            _pause_for_daily_quota(session_id, job, exc)
+            if not _await_daily_quota_reset(session_id):
+                return False
+            job = _load_job(session_id) or job
+            job["status"] = "running"
+            job["phase"] = _PHASE_EXTRACT
+            job["error"] = None
+            job["wait"] = None
+            _save_job(job)
+            continue
+        except Exception as exc:  # noqa: BLE001 — stocke l'erreur dans le job
+            if is_cancelled(session_id) or not _owns_worker(
+                session_id, worker_generation
+            ):
+                return False
+            logger.exception(
+                "Piece info failed session=%s: %s: %s",
+                session_id[:8],
+                type(exc).__name__,
+                exc,
+            )
+            job = _load_job(session_id) or job
+            job["status"] = "error"
+            job["phase"] = _PHASE_EXTRACT
+            job["error"] = MSG_EXTRACT_FAILED
+            job["wait"] = None
+            _save_job(job)
+            return False
+
+
 def run_extraction(session_id: str, worker_generation: int | None = None) -> None:
-    """Passe extract (lots) puis relecture Gemini finale."""
+    """Infos de la pièce, extraction des dialogues, puis relecture Gemini."""
     if is_cancelled(session_id) or not _owns_worker(session_id, worker_generation):
         return
 
@@ -1446,6 +1628,12 @@ def run_extraction(session_id: str, worker_generation: int | None = None) -> Non
         _touch_job(session_id)
 
     try:
+        if not _run_piece_info(session_id, job, on_wait, worker_generation):
+            return
+        job = _load_job(session_id) or job
+        pages_done = _as_int(job.get("pages_done"))
+        page_count = _as_int(job.get("pdf_page_count"))
+
         if pages_done >= page_count and _review_pending(job):
             _ = _run_final_review(session_id, on_wait, worker_generation)
             return

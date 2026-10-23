@@ -111,7 +111,7 @@ class SecurityHttpTests(unittest.TestCase):
         quota = self.client.get("/quota", params={"page_count": 20})
         self.assertEqual(quota.status_code, 200)
         q = quota.json()
-        self.assertEqual(q["batches_needed"], 5)
+        self.assertEqual(q["batches_needed"], 6)
         self.assertFalse(q["requires_confirmation"])
 
     def test_cors_allows_configured_origin(self) -> None:
@@ -245,9 +245,15 @@ class SecurityHttpTests(unittest.TestCase):
         session_id = self._make_ready_session(page_count=2)
         before = self.client.get("/quota").json()["batches_used"]
 
-        with patch(
-            "app.services.extract.gemini_client.extract_libretto_markdown",
-            side_effect=RuntimeError("simulated failure"),
+        with (
+            patch(
+                "app.services.extract.gemini_client.extract_piece_info",
+                side_effect=RuntimeError("simulated failure"),
+            ),
+            patch(
+                "app.services.extract.gemini_client.extract_libretto_markdown",
+                side_effect=RuntimeError("simulated failure"),
+            ),
         ):
             extract_service.write_libretto(session_id, "")
             now = datetime.now(timezone.utc).isoformat()
@@ -283,6 +289,10 @@ class SecurityHttpTests(unittest.TestCase):
 
         with (
             patch(
+                "app.services.extract.gemini_client.extract_piece_info",
+                return_value="# Carmen\n\nCompositeur : Bizet\n",
+            ),
+            patch(
                 "app.services.extract.gemini_client.extract_libretto_markdown",
                 return_value="# Titre\n\nTexte.\n",
             ),
@@ -312,7 +322,7 @@ class SecurityHttpTests(unittest.TestCase):
             extract_service.run_extraction(session_id)
 
         after = self.client.get("/quota").json()["batches_used"]
-        self.assertEqual(after, before + 2)
+        self.assertEqual(after, before + 3)
         status = self.client.get(f"/extract/sessions/{session_id}/status")
         body = status.json()
         self.assertEqual(body["status"], "done")

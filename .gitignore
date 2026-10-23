@@ -9,5 +9,6 @@ dist/
 .DS_Store
 data/
 *.pdf
-todo.txt
+todo.*
 .cursor/
+benchmark-zais.md

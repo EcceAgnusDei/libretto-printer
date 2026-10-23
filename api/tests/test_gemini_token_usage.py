@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from google.genai import types
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -159,6 +161,61 @@ class GeminiTokenUsageTests(unittest.TestCase):
         self.assertFalse(rows[0]["ok"])
         self.assertEqual(rows[0]["error_type"], "RuntimeError")
         self.assertEqual(rows[0]["kind"], "review")
+
+    def test_low_thinking_for_piece_info_and_review_only(self) -> None:
+        seen: list[types.ThinkingLevel | None] = []
+
+        def fake_generate(_parts: list[object], **kwargs: object) -> str:
+            level = kwargs.get("thinking_level")
+            if level is None or isinstance(level, types.ThinkingLevel):
+                seen.append(level)
+            return "ok"
+
+        image = Path(self._tmp.name) / "page.png"
+        image.write_bytes(b"\x89PNG\r\n")
+        with patch.object(
+            gemini_client,
+            "_generate_markdown",
+            side_effect=fake_generate,
+        ):
+            self.assertEqual(gemini_client.extract_piece_info([image]), "ok")
+            self.assertEqual(gemini_client.review_libretto_markdown("# T\n"), "ok")
+            self.assertEqual(
+                gemini_client.extract_libretto_markdown([image], ""),
+                "ok",
+            )
+
+        self.assertEqual(
+            seen,
+            [
+                types.ThinkingLevel.LOW,
+                types.ThinkingLevel.LOW,
+                None,
+            ],
+        )
+
+    def test_generate_markdown_sends_low_thinking_config(self) -> None:
+        response = SimpleNamespace(text="ok", usage_metadata=None)
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = response
+        with patch.object(gemini_client, "_get_client", return_value=mock_client):
+            gemini_client._generate_markdown(
+                [],
+                log_label="piece_info",
+                thinking_level=types.ThinkingLevel.LOW,
+            )
+            gemini_client._generate_markdown([], log_label="extract")
+
+        configs = [
+            call.kwargs["config"]
+            for call in mock_client.models.generate_content.call_args_list
+        ]
+        self.assertEqual(
+            configs[0].thinking_config.thinking_level,
+            types.ThinkingLevel.LOW,
+        )
+        self.assertFalse(configs[0].thinking_config.include_thoughts)
+        self.assertIsNone(configs[1].thinking_config)
 
 
 if __name__ == "__main__":
