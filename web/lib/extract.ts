@@ -1,3 +1,5 @@
+import type { ThinkingLevel } from "./apiConfig";
+
 function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
@@ -9,6 +11,8 @@ export type ExtractPhase = "extract" | "review";
 export type ExtractWaitReason = "rate_limit" | "daily" | "queue";
 
 export type ExtractWaitSource = "server" | "gemini";
+
+export type { ThinkingLevel };
 
 export type ExtractWaitInfo = {
   reason: ExtractWaitReason;
@@ -31,6 +35,7 @@ export type ExtractStartResult = {
   currentBatch: number;
   reviewDone: boolean;
   pdfReady: boolean;
+  thinkingLevel: ThinkingLevel;
   wait: ExtractWaitInfo | null;
 };
 
@@ -46,10 +51,21 @@ export type ExtractStatusResult = {
   currentBatch: number | null;
   reviewDone: boolean;
   pdfReady: boolean;
+  thinkingLevel: ThinkingLevel;
   error: string | null;
   wait: ExtractWaitInfo | null;
   stale: boolean;
 };
+
+function parseThinkingLevel(value: unknown): ThinkingLevel {
+  if (value === "low" || value === "medium") {
+    return value;
+  }
+  if (value === "high") {
+    return "medium";
+  }
+  return "low";
+}
 
 export function statusToStartResult(
   status: ExtractStatusResult,
@@ -67,6 +83,7 @@ export function statusToStartResult(
     currentBatch: status.currentBatch ?? 0,
     reviewDone: status.reviewDone,
     pdfReady: status.pdfReady,
+    thinkingLevel: status.thinkingLevel,
     wait: status.wait,
   };
 }
@@ -105,6 +122,7 @@ type ExtractApiPayload = {
   current_batch: number;
   review_done?: boolean;
   pdf_ready?: boolean;
+  thinking_level?: ThinkingLevel;
   wait?: {
     reason: ExtractWaitReason;
     message: string;
@@ -132,6 +150,7 @@ function mapStartLike(data: ExtractApiPayload): ExtractStartResult {
     currentBatch: data.current_batch,
     reviewDone: Boolean(data.review_done),
     pdfReady: Boolean(data.pdf_ready),
+    thinkingLevel: parseThinkingLevel(data.thinking_level),
     wait: mapWait(data.wait),
   };
 }
@@ -194,9 +213,14 @@ async function uploadPdf(sessionId: string, file: File): Promise<number> {
   return data.pdf_page_count;
 }
 
-async function startExtract(sessionId: string): Promise<ExtractStartResult> {
+async function startExtract(
+  sessionId: string,
+  thinkingLevel: ThinkingLevel,
+): Promise<ExtractStartResult> {
   const res = await fetch(`${apiBase()}/extract/sessions/${sessionId}/start`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thinking_level: thinkingLevel }),
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -228,12 +252,15 @@ export async function deleteSession(sessionId: string): Promise<void> {
   }
 }
 
-export async function triggerExtraction(file: File): Promise<ExtractStartResult> {
+export async function triggerExtraction(
+  file: File,
+  thinkingLevel: ThinkingLevel = "low",
+): Promise<ExtractStartResult> {
   await assertGeminiReady();
   const sessionId = await createSession(file.name);
   try {
     await uploadPdf(sessionId, file);
-    return await startExtract(sessionId);
+    return await startExtract(sessionId, thinkingLevel);
   } catch (err) {
     await deleteSession(sessionId);
     throw err;
@@ -259,6 +286,7 @@ export async function fetchExtractStatus(
     current_batch: number | null;
     review_done?: boolean;
     pdf_ready?: boolean;
+    thinking_level?: ThinkingLevel;
     error: string | null;
     stale?: boolean;
     wait?: {
@@ -281,6 +309,7 @@ export async function fetchExtractStatus(
     currentBatch: data.current_batch,
     reviewDone: Boolean(data.review_done),
     pdfReady: Boolean(data.pdf_ready),
+    thinkingLevel: parseThinkingLevel(data.thinking_level),
     error: data.error,
     wait: mapWait(data.wait),
     stale: Boolean(data.stale),

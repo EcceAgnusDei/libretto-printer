@@ -9,6 +9,7 @@ import {
   fetchQuotaForPages,
   type PublicConfig,
   type QuotaCheck,
+  type ThinkingLevel,
 } from "../lib/apiConfig";
 import {
   deleteSession,
@@ -21,6 +22,15 @@ import {
   type ExtractStartResult,
   type ExtractStatusResult,
 } from "../lib/extract";
+
+const THINKING_LEVEL_OPTIONS: {
+  value: ThinkingLevel;
+  label: string;
+  hint: string;
+}[] = [
+  { value: "low", label: "Faible", hint: "Plus rapide, moins coûteux" },
+  { value: "medium", label: "Élevé", hint: "Plus attentif, plus lent" },
+];
 import { validatePdfLocally, type LocalPdfPreview } from "../lib/pdfLocal";
 import {
   loadStoredSessions,
@@ -67,6 +77,7 @@ function startToStatus(result: ExtractStartResult): ExtractStatusResult {
     currentBatch: result.currentBatch,
     reviewDone: result.reviewDone,
     pdfReady: result.pdfReady,
+    thinkingLevel: result.thinkingLevel,
     error: null,
     wait: result.wait,
     stale: false,
@@ -141,6 +152,9 @@ function statusToneClass(status: ExtractStatusResult): string {
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [limits, setLimits] = useState<PublicConfig>(DEFAULT_PUBLIC_CONFIG);
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>(
+    DEFAULT_PUBLIC_CONFIG.gemini_thinking_level,
+  );
   const [phase, setPhase] = useState<UiPhase>("idle");
   const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -221,7 +235,10 @@ export default function Home() {
       try {
         const config = await fetchPublicConfig();
         console.info("[config] API /config →", config);
-        if (!cancelled) setLimits(config);
+        if (!cancelled) {
+          setLimits(config);
+          setThinkingLevel(config.gemini_thinking_level);
+        }
       } catch (err) {
         console.warn(
           "[config] fetch /config échoué, fallback defaults",
@@ -525,7 +542,7 @@ export default function Home() {
     setPhase("extracting");
 
     try {
-      const result = await triggerExtraction(loaded.file);
+      const result = await triggerExtraction(loaded.file, thinkingLevel);
       const asStatus = startToStatus(result);
       rememberFromStart(result);
       setTracked((prev) => [
@@ -820,6 +837,29 @@ export default function Home() {
                 <p className="text-sm text-zinc-500">
                   {loaded.pageCount} page{loaded.pageCount > 1 ? "s" : ""}
                 </p>
+              </div>
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="thinking-level"
+                  className="block text-sm font-medium text-zinc-800 dark:text-zinc-200"
+                >
+                  Niveau de réflexion
+                </label>
+                <select
+                  id="thinking-level"
+                  value={thinkingLevel}
+                  onChange={(event) =>
+                    setThinkingLevel(event.target.value as ThinkingLevel)
+                  }
+                  disabled={busy || extractBusy}
+                  className="w-full max-w-xs rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
+                >
+                  {THINKING_LEVEL_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} — {option.hint}
+                    </option>
+                  ))}
+                </select>
               </div>
               <button
                 type="button"

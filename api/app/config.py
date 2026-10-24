@@ -1,9 +1,12 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+
+ThinkingLevelName = Literal["low", "medium"]
 
 
 class Settings(BaseSettings):
@@ -16,6 +19,13 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
+    gemini_thinking_level: ThinkingLevelName = Field(
+        default="low",
+        validation_alias=AliasChoices(
+            "GEMINI_THINKING_LEVEL",
+            "gemini_thinking_level",
+        ),
+    )
     devlog: bool = Field(
         default=False,
         validation_alias=AliasChoices("DEVLOG", "devlog"),

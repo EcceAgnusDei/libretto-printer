@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from typing import cast
+
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import FileResponse
 
-from app.config import settings
+from app.config import ThinkingLevelName, settings
 from app.schemas.extract import (
     ExtractPhase,
+    ExtractStartRequest,
     ExtractStartResponse,
     ExtractStatusResponse,
     ExtractWaitInfo,
@@ -52,6 +55,15 @@ def _phase_from_job(job: dict) -> ExtractPhase:
     return "extract"
 
 
+def _thinking_level_from_job(job: dict) -> ThinkingLevelName:
+    raw = job.get("thinking_level")
+    if raw in {"low", "medium"}:
+        return cast(ThinkingLevelName, raw)
+    if raw == "high":
+        return "medium"
+    return settings.gemini_thinking_level
+
+
 def _start_like_response(job: dict) -> ExtractStartResponse:
     return ExtractStartResponse(
         session_id=job["session_id"],
@@ -65,6 +77,7 @@ def _start_like_response(job: dict) -> ExtractStartResponse:
         current_batch=job["current_batch"],
         review_done=bool(job.get("review_done")),
         pdf_ready=bool(job.get("pdf_ready")),
+        thinking_level=_thinking_level_from_job(job),
         wait=_wait_from_job(job),
     )
 
@@ -74,8 +87,16 @@ def _start_like_response(job: dict) -> ExtractStartResponse:
     response_model=ExtractStartResponse,
     dependencies=[Depends(_rate_limit_extract_start)],
 )
-def start_extract(session_id: str):
-    return _start_like_response(extract_service.start_job(session_id))
+def start_extract(
+    session_id: str,
+    body: ExtractStartRequest = Body(default_factory=ExtractStartRequest),
+):
+    return _start_like_response(
+        extract_service.start_job(
+            session_id,
+            thinking_level=body.thinking_level,
+        )
+    )
 
 
 @router.post(
@@ -105,6 +126,7 @@ def extract_status(session_id: str):
         current_batch=job.get("current_batch"),
         review_done=bool(job.get("review_done")),
         pdf_ready=bool(job.get("pdf_ready")),
+        thinking_level=_thinking_level_from_job(job),
         error=job.get("error"),
         wait=_wait_from_job(job),
         stale=bool(job.get("stale")),

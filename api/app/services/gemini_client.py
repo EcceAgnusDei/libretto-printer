@@ -10,7 +10,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 
-from app.config import settings
+from app.config import ThinkingLevelName, settings
 from app.devlog import devlog
 from app.services import gemini_token_usage
 from app.services.gemini_errors import (
@@ -22,6 +22,33 @@ from app.services.gemini_errors import (
     classify_gemini_error,
     wait_until_for_gemini_daily_error,
 )
+
+_THINKING_LEVELS: dict[ThinkingLevelName, types.ThinkingLevel] = {
+    "low": types.ThinkingLevel.LOW,
+    "medium": types.ThinkingLevel.MEDIUM,
+}
+
+
+def resolve_thinking_level(
+    level: ThinkingLevelName | types.ThinkingLevel | None = None,
+) -> types.ThinkingLevel:
+    if isinstance(level, types.ThinkingLevel):
+        return level
+    if level is None:
+        level = settings.gemini_thinking_level
+    return _THINKING_LEVELS[level]
+
+
+def thinking_level_label(
+    level: ThinkingLevelName | types.ThinkingLevel | None = None,
+) -> str:
+    resolved = resolve_thinking_level(level)
+    for name, enum_value in _THINKING_LEVELS.items():
+        if enum_value == resolved:
+            return name
+    raw = getattr(resolved, "value", resolved)
+    return str(raw).lower()
+
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +274,7 @@ def _record_usage(
     images: int | None = None,
     image_bytes: int | None = None,
     section_chars: int | None = None,
+    thinking_level: str | None = None,
     usage_metadata: object | None = None,
     error_type: str | None = None,
 ) -> None:
@@ -268,6 +296,8 @@ def _record_usage(
         payload["image_bytes"] = image_bytes
     if section_chars is not None:
         payload["section_chars"] = section_chars
+    if thinking_level is not None:
+        payload["thinking_level"] = thinking_level
     if error_type is not None:
         payload["error_type"] = error_type
     payload.update(_usage_to_dict(usage_metadata))
@@ -345,17 +375,16 @@ def _generate_markdown(
     image_bytes: int | None = None,
     section_chars: int | None = None,
     allow_empty: bool = False,
-    thinking_level: types.ThinkingLevel | None = None,
+    thinking_level: ThinkingLevelName | types.ThinkingLevel | None = None,
 ) -> str:
-    thinking_config: types.ThinkingConfig | None = None
-    if thinking_level is not None:
-        thinking_config = types.ThinkingConfig(
-            thinking_level=thinking_level,
-            include_thoughts=False,
-        )
+    resolved = resolve_thinking_level(thinking_level)
+    thinking_label = thinking_level_label(resolved)
     config = types.GenerateContentConfig(
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        thinking_config=thinking_config,
+        thinking_config=types.ThinkingConfig(
+            thinking_level=resolved,
+            include_thoughts=False,
+        ),
     )
 
     last_error: BaseException | None = None
@@ -368,12 +397,21 @@ def _generate_markdown(
         if on_attempt is not None:
             on_attempt()
         try:
-            devlog(
-                "Gemini %s model=%s attempt=%s/%s detail=%s",
+            logger.info(
+                "Gemini %s request model=%s attempt=%s/%s thinking=%s",
                 log_label,
                 settings.gemini_model,
                 attempt + 1,
                 max_attempts,
+                thinking_label,
+            )
+            devlog(
+                "Gemini %s model=%s attempt=%s/%s thinking=%s detail=%s",
+                log_label,
+                settings.gemini_model,
+                attempt + 1,
+                max_attempts,
+                thinking_label,
                 log_detail,
             )
             response = _get_client().models.generate_content(
@@ -385,6 +423,7 @@ def _generate_markdown(
             if not text and not allow_empty:
                 raise ValueError("Réponse Gemini vide")
             _raise_if_aborted(should_abort)
+            usage_metadata = getattr(response, "usage_metadata", None)
             _record_usage(
                 kind=log_label,
                 attempt=attempt + 1,
@@ -395,13 +434,23 @@ def _generate_markdown(
                 images=images,
                 image_bytes=image_bytes,
                 section_chars=section_chars,
-                usage_metadata=getattr(response, "usage_metadata", None),
+                thinking_level=thinking_label,
+                usage_metadata=usage_metadata,
             )
-            devlog(
-                "Gemini %s response model=%s attempt=%s chars=%s",
+            logger.info(
+                "Gemini %s response model=%s attempt=%s thinking=%s chars=%s",
                 log_label,
                 settings.gemini_model,
                 attempt + 1,
+                thinking_label,
+                len(text),
+            )
+            devlog(
+                "Gemini %s response model=%s attempt=%s thinking=%s chars=%s",
+                log_label,
+                settings.gemini_model,
+                attempt + 1,
+                thinking_label,
                 len(text),
             )
             if on_wait is not None:
@@ -420,6 +469,7 @@ def _generate_markdown(
                 images=images,
                 image_bytes=image_bytes,
                 section_chars=section_chars,
+                thinking_level=thinking_label,
                 error_type=type(exc).__name__,
             )
             if on_wait is not None:
@@ -454,6 +504,7 @@ def _generate_markdown(
                     images=images,
                     image_bytes=image_bytes,
                     section_chars=section_chars,
+                    thinking_level=thinking_label,
                     error_type=type(daily_exc).__name__,
                 )
                 if on_wait is not None:
@@ -489,6 +540,7 @@ def _generate_markdown(
         images=images,
         image_bytes=image_bytes,
         section_chars=section_chars,
+        thinking_level=thinking_label,
         error_type=type(last_error).__name__,
     )
     raise last_error
@@ -504,6 +556,7 @@ def extract_libretto_markdown(
     source_name: str | None = None,
     batch_index: int | None = None,
     on_attempt: AttemptCallback | None = None,
+    thinking_level: ThinkingLevelName | None = None,
 ) -> str:
     """Envoie images + contexte depuis le dernier titre ; retourne la section mise à jour."""
     if not image_paths:
@@ -563,6 +616,7 @@ def extract_libretto_markdown(
         images=len(image_paths),
         image_bytes=image_bytes,
         section_chars=len(ctx),
+        thinking_level=thinking_level,
     )
 
 
@@ -574,6 +628,7 @@ def extract_piece_info(
     session_id: str | None = None,
     source_name: str | None = None,
     on_attempt: AttemptCallback | None = None,
+    thinking_level: ThinkingLevelName | None = None,
 ) -> str:
     """Lit les premières pages et renvoie les informations imprimées de la pièce."""
     if not image_paths:
@@ -616,7 +671,7 @@ def extract_piece_info(
         images=len(image_paths),
         image_bytes=image_bytes,
         allow_empty=True,
-        thinking_level=types.ThinkingLevel.LOW,
+        thinking_level=thinking_level if thinking_level is not None else "low",
     )
 
 
@@ -628,6 +683,7 @@ def review_libretto_markdown(
     session_id: str | None = None,
     source_name: str | None = None,
     on_attempt: AttemptCallback | None = None,
+    thinking_level: ThinkingLevelName | None = None,
 ) -> str:
     """Relecture finale du libretto complet (texte seul, sans images)."""
     text = markdown.strip()
@@ -652,5 +708,5 @@ def review_libretto_markdown(
         source_name=source_name,
         on_attempt=on_attempt,
         section_chars=len(text),
-        thinking_level=types.ThinkingLevel.LOW,
+        thinking_level=thinking_level if thinking_level is not None else "low",
     )

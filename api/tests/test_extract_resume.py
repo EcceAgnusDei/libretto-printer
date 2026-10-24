@@ -2233,6 +2233,35 @@ class ExtractResumeTests(unittest.TestCase):
         self.assertEqual(extract_service.read_piece_info(session_id), "")
         self.assertFalse(job.get("piece_info_done"))
 
+    def test_start_job_persists_thinking_level(self) -> None:
+        session_id = self._make_session(2)
+        with patch.object(extract_service, "_spawn_worker"):
+            job = extract_service.start_job(session_id, thinking_level="medium")
+        self.assertEqual(job["thinking_level"], "medium")
+        loaded = extract_service._load_job(session_id)
+        assert loaded is not None
+        self.assertEqual(loaded["thinking_level"], "medium")
+        with patch.object(extract_service, "_spawn_worker"):
+            default_job = extract_service.start_job(self._make_session(2))
+        self.assertEqual(
+            default_job["thinking_level"],
+            settings.gemini_thinking_level,
+        )
+
+    def test_thinking_level_from_job_falls_back_to_settings(self) -> None:
+        self.assertEqual(
+            extract_service._thinking_level_from_job({}),
+            settings.gemini_thinking_level,
+        )
+        self.assertEqual(
+            extract_service._thinking_level_from_job({"thinking_level": "low"}),
+            "low",
+        )
+        self.assertEqual(
+            extract_service._thinking_level_from_job({"thinking_level": "high"}),
+            "medium",
+        )
+
     def test_get_libretto_prefixes_piece_info_until_review(self) -> None:
         session_id = self._make_session(2)
         self._save_running_extract_job(session_id, page_count=2, batch_size=2)

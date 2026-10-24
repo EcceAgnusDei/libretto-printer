@@ -129,6 +129,7 @@ class GeminiTokenUsageTests(unittest.TestCase):
         self.assertEqual(row["prompt_token_count"], 100)
         self.assertEqual(row["candidates_token_count"], 40)
         self.assertEqual(row["thoughts_token_count"], 5)
+        self.assertEqual(row["thinking_level"], "low")
         self.assertEqual(row["total_token_count"], 145)
         self.assertEqual(
             row["prompt_tokens_details"],
@@ -162,13 +163,11 @@ class GeminiTokenUsageTests(unittest.TestCase):
         self.assertEqual(rows[0]["error_type"], "RuntimeError")
         self.assertEqual(rows[0]["kind"], "review")
 
-    def test_low_thinking_for_piece_info_and_review_only(self) -> None:
-        seen: list[types.ThinkingLevel | None] = []
+    def test_public_helpers_forward_thinking_level(self) -> None:
+        seen: list[object] = []
 
         def fake_generate(_parts: list[object], **kwargs: object) -> str:
-            level = kwargs.get("thinking_level")
-            if level is None or isinstance(level, types.ThinkingLevel):
-                seen.append(level)
+            seen.append(kwargs.get("thinking_level"))
             return "ok"
 
         image = Path(self._tmp.name) / "page.png"
@@ -181,20 +180,21 @@ class GeminiTokenUsageTests(unittest.TestCase):
             self.assertEqual(gemini_client.extract_piece_info([image]), "ok")
             self.assertEqual(gemini_client.review_libretto_markdown("# T\n"), "ok")
             self.assertEqual(
+                gemini_client.extract_libretto_markdown(
+                    [image],
+                    "",
+                    thinking_level="medium",
+                ),
+                "ok",
+            )
+            self.assertEqual(
                 gemini_client.extract_libretto_markdown([image], ""),
                 "ok",
             )
 
-        self.assertEqual(
-            seen,
-            [
-                types.ThinkingLevel.LOW,
-                types.ThinkingLevel.LOW,
-                None,
-            ],
-        )
+        self.assertEqual(seen, ["low", "low", "medium", None])
 
-    def test_generate_markdown_sends_low_thinking_config(self) -> None:
+    def test_generate_markdown_sends_thinking_config(self) -> None:
         response = SimpleNamespace(text="ok", usage_metadata=None)
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = response
@@ -202,9 +202,13 @@ class GeminiTokenUsageTests(unittest.TestCase):
             gemini_client._generate_markdown(
                 [],
                 log_label="piece_info",
-                thinking_level=types.ThinkingLevel.LOW,
+                thinking_level="low",
             )
-            gemini_client._generate_markdown([], log_label="extract")
+            gemini_client._generate_markdown(
+                [],
+                log_label="extract",
+                thinking_level="medium",
+            )
 
         configs = [
             call.kwargs["config"]
@@ -215,7 +219,37 @@ class GeminiTokenUsageTests(unittest.TestCase):
             types.ThinkingLevel.LOW,
         )
         self.assertFalse(configs[0].thinking_config.include_thoughts)
-        self.assertIsNone(configs[1].thinking_config)
+        self.assertEqual(
+            configs[1].thinking_config.thinking_level,
+            types.ThinkingLevel.MEDIUM,
+        )
+        self.assertFalse(configs[1].thinking_config.include_thoughts)
+
+    def test_generate_markdown_logs_thinking_level(self) -> None:
+        response = SimpleNamespace(text="ok", usage_metadata=None)
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = response
+        with (
+            patch.object(gemini_client, "_get_client", return_value=mock_client),
+            patch.object(gemini_client.logger, "info") as info_mock,
+        ):
+            gemini_client._generate_markdown(
+                [],
+                log_label="extract",
+                thinking_level="medium",
+            )
+
+        messages = [call.args[0] % call.args[1:] for call in info_mock.call_args_list]
+        self.assertTrue(
+            any(
+                "request" in msg and "thinking=medium" in msg
+                for msg in messages
+            )
+        )
+        self.assertTrue(
+            any("response" in msg and "thinking=medium" in msg for msg in messages)
+        )
+        self.assertFalse(any("thoughts_tokens" in msg for msg in messages))
 
 
 if __name__ == "__main__":

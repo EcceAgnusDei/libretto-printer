@@ -1,14 +1,28 @@
+export type ThinkingLevel = "low" | "medium";
+
 export type PublicConfig = {
   max_upload_bytes: number;
   max_pages: number;
   batch_size: number;
+  gemini_thinking_level: ThinkingLevel;
 };
 
 export const DEFAULT_PUBLIC_CONFIG: PublicConfig = {
   max_upload_bytes: 50 * 1024 * 1024,
   max_pages: 500,
   batch_size: 5,
+  gemini_thinking_level: "low",
 };
+
+function parseThinkingLevel(value: unknown): ThinkingLevel {
+  if (value === "low" || value === "medium") {
+    return value;
+  }
+  if (value === "high") {
+    return "medium";
+  }
+  return DEFAULT_PUBLIC_CONFIG.gemini_thinking_level;
+}
 
 function apiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -33,6 +47,7 @@ export async function fetchPublicConfig(): Promise<PublicConfig> {
       typeof data.batch_size === "number"
         ? data.batch_size
         : DEFAULT_PUBLIC_CONFIG.batch_size,
+    gemini_thinking_level: parseThinkingLevel(data.gemini_thinking_level),
   };
 }
 

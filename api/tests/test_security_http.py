@@ -107,6 +107,7 @@ class SecurityHttpTests(unittest.TestCase):
         body = config.json()
         self.assertEqual(body["gemini_max_batches_per_day"], 100)
         self.assertEqual(body["batches_used_today"], 0)
+        self.assertIn(body["gemini_thinking_level"], {"low", "medium"})
 
         quota = self.client.get("/quota", params={"page_count": 20})
         self.assertEqual(quota.status_code, 200)
@@ -237,6 +238,30 @@ class SecurityHttpTests(unittest.TestCase):
         self.assertFalse(session_dir.exists())
         missing = self.client.get(f"/ingest/sessions/{session_id}")
         self.assertEqual(missing.status_code, 404)
+
+    def test_start_accepts_thinking_level_and_rejects_invalid(self) -> None:
+        settings.rate_limit_upload_max = 50
+        settings.rate_limit_extract_start_max = 50
+        rate_limit.reset_for_tests()
+        session_id = self._make_ready_session(page_count=2)
+
+        with patch.object(extract_service, "_spawn_worker"):
+            ok = self.client.post(
+                f"/extract/sessions/{session_id}/start",
+                json={"thinking_level": "medium"},
+            )
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(ok.json()["thinking_level"], "medium")
+        job = extract_service._load_job(session_id)
+        assert job is not None
+        self.assertEqual(job["thinking_level"], "medium")
+
+        bad_session = self._make_ready_session(page_count=2)
+        bad = self.client.post(
+            f"/extract/sessions/{bad_session}/start",
+            json={"thinking_level": "high"},
+        )
+        self.assertEqual(bad.status_code, 422)
 
     def test_failed_gemini_does_not_increment_usage_over_http_worker(self) -> None:
         settings.rate_limit_upload_max = 50

@@ -17,7 +17,7 @@ from typing import cast
 
 from fastapi import HTTPException
 
-from app.config import settings
+from app.config import ThinkingLevelName, settings
 from app.services import gemini_client
 from app.services import ingest as ingest_service
 from app.services import usage_quota
@@ -91,6 +91,15 @@ def _as_int(value: object, default: int = 0) -> int:
         except ValueError:
             return default
     return default
+
+
+def _thinking_level_from_job(job: JobDict) -> ThinkingLevelName:
+    raw = job.get("thinking_level")
+    if raw in {"low", "medium"}:
+        return cast(ThinkingLevelName, raw)
+    if raw == "high":
+        return "medium"
+    return settings.gemini_thinking_level
 
 
 def _review_pending(job: JobDict) -> bool:
@@ -618,7 +627,11 @@ def assert_preconditions(
     return meta
 
 
-def start_job(session_id: str) -> JobDict:
+def start_job(
+    session_id: str,
+    *,
+    thinking_level: ThinkingLevelName | None = None,
+) -> JobDict:
     """Ouvre le job et lance la passe unique en arrière-plan.
 
     Un job en pause quota, en erreur repriseable (ou legacy error+daily)
@@ -636,6 +649,11 @@ def start_job(session_id: str) -> JobDict:
     batch_size = settings.batch_size
     page_count = meta.pdf_page_count
     now = _now_iso()
+    level: ThinkingLevelName = (
+        thinking_level
+        if thinking_level is not None
+        else settings.gemini_thinking_level
+    )
 
     write_libretto(session_id, "")
     write_piece_info(session_id, "")
@@ -657,6 +675,7 @@ def start_job(session_id: str) -> JobDict:
         "review_done": False,
         "piece_info_done": False,
         "pdf_ready": False,
+        "thinking_level": level,
         "error": None,
         "wait": None,
         "created_at": now,
@@ -1402,6 +1421,7 @@ def _run_final_review(
                 on_attempt=on_attempt,
                 session_id=session_id,
                 source_name=str(job.get("source_name") or "") or None,
+                thinking_level="low",
             )
             if not _owns_worker(session_id, worker_generation):
                 logger.info("Extract worker superseded session=%s", session_id[:8])
@@ -1526,6 +1546,7 @@ def _run_piece_info(
                 on_attempt=on_attempt,
                 session_id=session_id,
                 source_name=str(job.get("source_name") or "") or None,
+                thinking_level="low",
             )
             if not _owns_worker(session_id, worker_generation):
                 logger.info("Extract worker superseded session=%s", session_id[:8])
@@ -1691,6 +1712,7 @@ def run_extraction(session_id: str, worker_generation: int | None = None) -> Non
                     session_id=session_id,
                     source_name=str(job.get("source_name") or "") or None,
                     batch_index=batch_index,
+                    thinking_level=_thinking_level_from_job(job),
                 )
                 if not _owns_worker(session_id, worker_generation):
                     logger.info(

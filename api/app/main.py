@@ -85,6 +85,7 @@ def public_config() -> dict[str, object]:
         "max_upload_bytes": settings.max_upload_bytes,
         "max_pages": settings.max_pages_per_session,
         "batch_size": settings.batch_size,
+        "gemini_thinking_level": settings.gemini_thinking_level,
         "gemini_max_batches_per_day": usage["batches_limit"],
         "batches_used_today": usage["batches_used"],
         "batches_remaining_today": usage["batches_remaining"],
